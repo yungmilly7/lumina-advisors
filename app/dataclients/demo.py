@@ -316,3 +316,60 @@ def generate_fundamentals(ticker: str) -> dict:
         "analyst_recommendation": recommendation,
         "num_analyst_opinions": num_analysts,
     }
+
+
+_SYNTHETIC_OWNER_NAMES = [
+    "A. Whitfield", "B. Ncube", "C. Delacroix", "D. Yamashita", "E. Okafor",
+    "F. Sørensen", "G. Petrov", "H. Alvarado", "I. Nakamura", "J. Fitzgerald",
+]
+
+
+def generate_insider_transactions(ticker: str, as_of: date | None = None) -> list[dict]:
+    """Synthetic Form 4 open-market buy/sell history for demo mode,
+    deterministic per ticker. Real insider activity is bursty and often
+    absent for months at a time -- some tickers get zero rows here, same as
+    a real company that simply hasn't had an open-market insider trade
+    lately, which is deliberate rather than a bug."""
+    as_of = as_of or datetime.now(timezone.utc).date()
+    rng = np.random.default_rng(_seed_for(ticker) ^ 0x1D5B7E31)
+    base_price = _base_price(ticker)
+
+    # Most companies have a handful of insiders who trade occasionally, not
+    # constantly -- weight toward few-or-zero transactions in the trailing
+    # window rather than a uniform spread.
+    n_txns = int(rng.choice([0, 1, 2, 3, 4, 5, 6, 8], p=[0.15, 0.2, 0.2, 0.15, 0.1, 0.1, 0.05, 0.05]))
+    if n_txns == 0:
+        return []
+
+    owners = rng.choice(_SYNTHETIC_OWNER_NAMES, size=min(len(_SYNTHETIC_OWNER_NAMES), rng.integers(1, 4)), replace=False)
+    rows = []
+    for _ in range(n_txns):
+        owner_name = str(rng.choice(owners))
+        days_ago = int(rng.integers(1, 180))
+        txn_date = as_of - timedelta(days=days_ago)
+        # Insiders sell (rebalancing, tax, diversification) far more often
+        # than they buy on the open market, historically -- an open-market
+        # buy is the rarer, more information-laden signal.
+        code = "S" if rng.random() < 0.78 else "P"
+        is_officer = bool(rng.random() < 0.6)
+        is_director = bool(not is_officer and rng.random() < 0.5)
+        is_ten_pct = bool(rng.random() < 0.1)
+        shares = float(rng.integers(500, 50_000))
+        price = float(base_price * (1 + rng.normal(0, 0.08)))
+        price = max(price, 0.5)
+        rows.append(
+            {
+                "transaction_date": txn_date.isoformat(),
+                "owner_name": owner_name,
+                "is_officer": is_officer,
+                "is_director": is_director,
+                "is_ten_pct_owner": is_ten_pct,
+                "transaction_code": code,
+                "acquired_disposed": "A" if code == "P" else "D",
+                "shares": shares,
+                "price": round(price, 2),
+                "value_usd": round(shares * price, 2),
+            }
+        )
+    rows.sort(key=lambda r: r["transaction_date"], reverse=True)
+    return rows

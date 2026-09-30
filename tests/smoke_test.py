@@ -230,6 +230,160 @@ class TestSecEdgarFilings(unittest.TestCase):
         self.assertEqual({r["form_type"] for r in rows}, {"10-K", "10-Q"})
 
 
+_SAMPLE_FORM4_XML = """<?xml version="1.0"?>
+<ownershipDocument>
+    <reportingOwner>
+        <reportingOwnerId>
+            <rptOwnerCik>0001234567</rptOwnerCik>
+            <rptOwnerName>Jane Q. Insider</rptOwnerName>
+        </reportingOwnerId>
+        <reportingOwnerRelationship>
+            <isDirector>0</isDirector>
+            <isOfficer>1</isOfficer>
+            <isTenPercentOwner>0</isTenPercentOwner>
+            <officerTitle>Chief Financial Officer</officerTitle>
+        </reportingOwnerRelationship>
+    </reportingOwner>
+    <nonDerivativeTable>
+        <nonDerivativeTransaction>
+            <transactionDate>
+                <value>2026-01-15</value>
+            </transactionDate>
+            <transactionCoding>
+                <transactionCode>P</transactionCode>
+            </transactionCoding>
+            <transactionAmounts>
+                <transactionShares><value>1000</value></transactionShares>
+                <transactionPricePerShare><value>42.50</value></transactionPricePerShare>
+                <transactionAcquiredDisposedCode><value>A</value></transactionAcquiredDisposedCode>
+            </transactionAmounts>
+        </nonDerivativeTransaction>
+        <nonDerivativeTransaction>
+            <transactionDate>
+                <value>2026-01-20</value>
+            </transactionDate>
+            <transactionCoding>
+                <transactionCode>S</transactionCode>
+            </transactionCoding>
+            <transactionAmounts>
+                <transactionShares><value>500</value></transactionShares>
+                <transactionPricePerShare><value>44.00</value></transactionPricePerShare>
+                <transactionAcquiredDisposedCode><value>D</value></transactionAcquiredDisposedCode>
+            </transactionAmounts>
+        </nonDerivativeTransaction>
+        <nonDerivativeTransaction>
+            <!-- Code A is a grant/award, not an open-market trade; must be excluded. -->
+            <transactionDate>
+                <value>2026-02-01</value>
+            </transactionDate>
+            <transactionCoding>
+                <transactionCode>A</transactionCode>
+            </transactionCoding>
+            <transactionAmounts>
+                <transactionShares><value>2000</value></transactionShares>
+                <transactionPricePerShare><value>0</value></transactionPricePerShare>
+                <transactionAcquiredDisposedCode><value>A</value></transactionAcquiredDisposedCode>
+            </transactionAmounts>
+        </nonDerivativeTransaction>
+    </nonDerivativeTable>
+</ownershipDocument>
+"""
+
+
+class TestForm4Parsing(unittest.TestCase):
+    """The parser is the one place where getting the schema wrong (which
+    codes count, which elements are <value>-wrapped) would silently corrupt
+    the insider-signal feature, so it's tested directly against a hand-built
+    sample rather than only indirectly through the demo pipeline."""
+
+    def test_only_open_market_p_and_s_codes_are_kept(self):
+        from app.dataclients.secedgar import _parse_form4_xml
+
+        rows = _parse_form4_xml(_SAMPLE_FORM4_XML)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r["transaction_code"] for r in rows}, {"P", "S"})
+
+    def test_fields_parsed_correctly(self):
+        from app.dataclients.secedgar import _parse_form4_xml
+
+        rows = {r["transaction_code"]: r for r in _parse_form4_xml(_SAMPLE_FORM4_XML)}
+        buy = rows["P"]
+        self.assertEqual(buy["transaction_date"], "2026-01-15")
+        self.assertEqual(buy["owner_name"], "Jane Q. Insider")
+        self.assertTrue(buy["is_officer"])
+        self.assertFalse(buy["is_director"])
+        self.assertEqual(buy["shares"], 1000.0)
+        self.assertEqual(buy["price"], 42.5)
+        self.assertEqual(buy["value_usd"], 42500.0)
+
+        sell = rows["S"]
+        self.assertEqual(sell["shares"], 500.0)
+        self.assertEqual(sell["value_usd"], 22000.0)
+
+    def test_malformed_xml_returns_empty_list_rather_than_raising(self):
+        from app.dataclients.secedgar import _parse_form4_xml
+
+        self.assertEqual(_parse_form4_xml("<not><valid"), [])
+        self.assertEqual(_parse_form4_xml(""), [])
+
+    def test_fetch_insider_transactions_filters_to_form_4_only(self):
+        from unittest.mock import patch
+        import app.dataclients.secedgar as secedgar
+
+        secedgar._cik_map_cache = {"TEST": "1234567890"}
+        forms = ["4", "10-K", "4", "DEF 14A"]
+        fake_submissions = {
+            "filings": {
+                "recent": {
+                    "form": forms,
+                    "accessionNumber": [f"0001234567-26-{i:06d}" for i in range(len(forms))],
+                    "primaryDocument": [f"doc{i}.xml" for i in range(len(forms))],
+                }
+            }
+        }
+        with patch("app.dataclients.secedgar.get_json", return_value=fake_submissions), \
+             patch("app.dataclients.secedgar.get_text", return_value=_SAMPLE_FORM4_XML) as mock_get_text:
+            rows = secedgar.fetch_insider_transactions("TEST", limit_filings=20)
+
+        self.assertEqual(mock_get_text.call_count, 2)  # only the two "4" filings
+        self.assertEqual(len(rows), 4)  # 2 open-market rows x 2 filings
+
+
+class TestInsiderTransactionsDbAndDemo(unittest.TestCase):
+    def test_demo_generator_is_deterministic_per_ticker(self):
+        from app.dataclients import demo
+
+        rows_a = demo.generate_insider_transactions("AAPL")
+        rows_b = demo.generate_insider_transactions("AAPL")
+        self.assertEqual(rows_a, rows_b)
+
+    def test_demo_generator_only_emits_open_market_codes(self):
+        from app.dataclients import demo
+
+        for ticker in ("AAPL", "MSFT", "NVDA", "TSLA"):
+            for row in demo.generate_insider_transactions(ticker):
+                self.assertIn(row["transaction_code"], ("P", "S"))
+                self.assertGreater(row["shares"], 0)
+                self.assertGreaterEqual(row["value_usd"], 0)
+
+    def test_db_roundtrip_and_ignores_exact_duplicates(self):
+        from app import db
+
+        rows = [
+            {
+                "transaction_date": "2026-03-01", "owner_name": "Test Owner",
+                "is_officer": True, "is_director": False, "is_ten_pct_owner": False,
+                "transaction_code": "P", "acquired_disposed": "A",
+                "shares": 100.0, "price": 10.0, "value_usd": 1000.0,
+            }
+        ]
+        db.upsert_insider_transactions("ZZZZ_TEST", rows)
+        db.upsert_insider_transactions("ZZZZ_TEST", rows)  # duplicate insert, should be ignored
+        stored = db.get_insider_transactions("ZZZZ_TEST", limit=10)
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["owner_name"], "Test Owner")
+
+
 class TestYahooCrumbHandshake(unittest.TestCase):
     """Regression test: fc.yahoo.com's cookie-seed request routinely answers
     with a 404 (it's an edge/accelerator endpoint, not a real page) while
@@ -333,7 +487,7 @@ class TestAPI(unittest.TestCase):
         r = self.client.get("/api/forecast/AAPL?horizon=5&narrative=0")
         self.assertEqual(r.status_code, 200)
         d = r.json()
-        for key in ("price_history", "earnings", "filings", "news", "neighbors", "drivers", "rationale"):
+        for key in ("price_history", "earnings", "filings", "news", "insider_transactions", "neighbors", "drivers", "rationale"):
             self.assertIn(key, d)
         self.assertGreater(len(d["price_history"]), 50)
 
@@ -677,10 +831,20 @@ class TestNewTechnicalFeatures(unittest.TestCase):
     def test_new_feature_columns_present_and_finite(self):
         panel = self.engine.panel
         for name in ("macd_hist", "bollinger_pct_b", "bollinger_bandwidth", "atr_pct",
-                     "days_since_filing", "filing_count_30d"):
+                     "days_since_filing", "filing_count_30d",
+                     "insider_net_buy_ratio_90d", "insider_buy_count_90d"):
             self.assertIn(name, panel.features)
             df = panel.features[name]
             self.assertTrue(np.isfinite(df.to_numpy()).all(), f"{name} has non-finite values")
+
+    def test_insider_net_buy_ratio_stays_within_signed_range(self):
+        # Dollar-weighted net buy/sell balance can never exceed +/-1 by
+        # construction (it's a signed value divided by its own absolute
+        # total), so a value outside that range would mean the sign/window
+        # math in _insider_features is broken.
+        panel = self.engine.panel
+        values = panel.features["insider_net_buy_ratio_90d"].to_numpy()
+        self.assertTrue((values >= -1.0001).all() and (values <= 1.0001).all())
 
     def test_filing_recency_varies_across_companies(self):
         panel = self.engine.panel
@@ -726,7 +890,8 @@ class TestLiveIngestionPartialFailureFallback(unittest.TestCase):
         def fake_fetch(ticker, company_name, need):
             if ticker in failing:
                 return {"ticker": ticker, "bars": None, "earnings": None,
-                         "filings": None, "news": None, "fundamentals": None, "sources": {}}
+                         "filings": None, "news": None, "fundamentals": None,
+                         "insider_txns": None, "sources": {}}
             bundle = demo_dataset[ticker]
             return {
                 "ticker": ticker,
@@ -735,6 +900,7 @@ class TestLiveIngestionPartialFailureFallback(unittest.TestCase):
                 "filings": bundle["filings"],
                 "news": bundle["news"],
                 "fundamentals": demo_client.generate_fundamentals(ticker),
+                "insider_txns": demo_client.generate_insider_transactions(ticker),
                 "sources": {f: "test" for f in db.PROVENANCE_FIELDS},
             }
 

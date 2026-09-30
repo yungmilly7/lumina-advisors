@@ -75,6 +75,8 @@ FACTOR_LABELS = {
     "atr_pct": "average true range (volatility, % of price)",
     "days_since_filing": "days since last SEC filing",
     "filing_count_30d": "SEC filing activity (30d)",
+    "insider_net_buy_ratio_90d": "insider open-market buy/sell balance (90d)",
+    "insider_buy_count_90d": "insider open-market buys (90d)",
 }
 
 

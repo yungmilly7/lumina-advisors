@@ -186,6 +186,9 @@ def forecast_detail(request):
     filings = db.get_filings(ticker, limit=10)
     row["filings"] = [dict(fl) for fl in filings]
 
+    insider_rows = db.get_insider_transactions(ticker, limit=15)
+    row["insider_transactions"] = [dict(i) for i in insider_rows]
+
     news_rows = db.get_news(ticker, limit=12)
     row["news"] = [
         {**dict(n), "event_tags": json.loads(n["event_tags"] or "[]")} for n in news_rows

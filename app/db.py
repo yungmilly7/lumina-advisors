@@ -195,6 +195,27 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     status TEXT NOT NULL            -- ok | error
 );
 CREATE INDEX IF NOT EXISTS idx_paper_trades_as_of ON paper_trades(as_of);
+
+-- Open-market insider buy/sell transactions (SEC Form 4, transaction codes
+-- P and S only -- see app.dataclients.secedgar._parse_form4_xml). Treated
+-- like filings/news: append-only historical data fetched best-effort, with
+-- no per-field freshness tracking in data_provenance, since a Form 4 filed
+-- last month doesn't go "stale" the way a live price quote does.
+CREATE TABLE IF NOT EXISTS insider_transactions (
+    ticker TEXT NOT NULL,
+    transaction_date TEXT NOT NULL,
+    owner_name TEXT NOT NULL,
+    is_officer INTEGER DEFAULT 0,
+    is_director INTEGER DEFAULT 0,
+    is_ten_pct_owner INTEGER DEFAULT 0,
+    transaction_code TEXT NOT NULL,   -- P (buy) | S (sell)
+    acquired_disposed TEXT,           -- A | D
+    shares REAL,
+    price REAL,
+    value_usd REAL,
+    PRIMARY KEY (ticker, transaction_date, owner_name, transaction_code, shares)
+);
+CREATE INDEX IF NOT EXISTS idx_insider_txn_ticker_date ON insider_transactions(ticker, transaction_date);
 """
 
 
@@ -311,6 +332,38 @@ def upsert_filings(ticker: str, rows: list[dict]) -> None:
 def get_filings(ticker: str, limit: int = 20) -> list[sqlite3.Row]:
     return get_conn().execute(
         "SELECT * FROM filings WHERE ticker=? ORDER BY filed_date DESC LIMIT ?",
+        (ticker, limit),
+    ).fetchall()
+
+
+def upsert_insider_transactions(ticker: str, rows: list[dict]) -> None:
+    if not rows:
+        return
+    with tx() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO insider_transactions(ticker, transaction_date, "
+            "owner_name, is_officer, is_director, is_ten_pct_owner, transaction_code, "
+            "acquired_disposed, shares, price, value_usd) VALUES "
+            "(:ticker, :transaction_date, :owner_name, :is_officer, :is_director, "
+            ":is_ten_pct_owner, :transaction_code, :acquired_disposed, :shares, "
+            ":price, :value_usd)",
+            [
+                {
+                    **r,
+                    "ticker": ticker,
+                    "is_officer": int(bool(r.get("is_officer"))),
+                    "is_director": int(bool(r.get("is_director"))),
+                    "is_ten_pct_owner": int(bool(r.get("is_ten_pct_owner"))),
+                }
+                for r in rows
+            ],
+        )
+
+
+def get_insider_transactions(ticker: str, limit: int = 50) -> list[sqlite3.Row]:
+    return get_conn().execute(
+        "SELECT * FROM insider_transactions WHERE ticker=? "
+        "ORDER BY transaction_date DESC LIMIT ?",
         (ticker, limit),
     ).fetchall()
 

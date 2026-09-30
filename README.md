@@ -54,7 +54,9 @@ app/
   dataclients/
     yahoo.py       live daily prices + earnings calendar (Yahoo Finance's
                     public chart/quoteSummary endpoints, no API key)
-    secedgar.py     live SEC filings (10-K/10-Q/8-K) via EDGAR's JSON API
+    secedgar.py     live SEC filings (10-K/10-Q/8-K) via EDGAR's JSON API,
+                    plus open-market insider buy/sell transactions parsed
+                    out of Form 4 filings (see "Insider transactions" below)
     news.py         Google News RSS + a transparent lexicon-based
                     sentiment/event-tag scorer (no ML black box, no API key)
     demo.py         deterministic synthetic data generator -- same
@@ -68,9 +70,9 @@ app/
   signals.py       turns raw data into a per-company/day feature panel:
                    momentum, volatility, RSI, volume anomalies, earnings
                    timing, decayed news sentiment, sector/market momentum,
-                   and the graph spillover features (a matrix multiply of
-                   neighbor momentum/sentiment against the relationship
-                   graph's signed, weighted adjacency matrix)
+                   insider buy/sell balance, and the graph spillover features
+                   (a matrix multiply of neighbor momentum/sentiment against
+                   the relationship graph's signed, weighted adjacency matrix)
   ml.py            small pure-numpy StandardScaler / RidgeRegression /
                    LogisticRegression / Pipeline -- see "Why zero
                    dependencies" below
@@ -188,6 +190,24 @@ since that only re-runs the pipeline without reloading code. Hit
 `POST /api/refresh` (or the "Refresh data" button) any time after that to
 re-pull data and retrain.
 
+## Insider transactions
+
+Every company's forecast page shows recent open-market insider buys/sells,
+and the model gets two features built from the same data:
+`insider_net_buy_ratio_90d` (a dollar-weighted -1..+1 balance of buying vs.
+selling in the trailing 90 days) and `insider_buy_count_90d`.
+
+This comes from SEC EDGAR Form 4 filings -- free, no API key, same source
+as the 10-K/10-Q/8-K filings already shown. Only transaction codes `P`
+(open-market purchase) and `S` (open-market sale) are counted; codes like
+`A` (grants/awards), `F` (tax withholding), `M` (option exercises), and `G`
+(gifts) are compensation/administrative noise by academic convention, not a
+genuine discretionary trading decision, so they're filtered out before this
+ever reaches the model. Like filings and news, it's fetched best-effort on
+every run rather than tracked for "freshness" -- an empty result usually
+just means that company's insiders haven't made an open-market trade
+recently, which is a real, common state, not a fetch failure.
+
 ## Adding the AI narrative layer and chat
 
 Set `ANTHROPIC_API_KEY` in `.env` and two things turn on: the forecast
@@ -295,3 +315,9 @@ public demo shares or can affect.
   learnable than real markets (the graph pass-through and event jumps are
   baked into how it's generated) -- don't read the demo-mode backtest
   numbers as a claim about real-market performance.
+- The insider-transaction signal is a real, published academic effect on
+  average across large samples, not a reliable predictor for any single
+  company or trade -- most companies have only a handful of open-market
+  Form 4 transactions in a given quarter, which is too small a sample to
+  read much into on its own. It's one input among ~20+, not a standalone
+  "insiders are buying" call.

@@ -13,6 +13,11 @@ Per data category, "live" now means:
   fundamentals  Finnhub if configured, else Yahoo
   filings       SEC EDGAR (public, no key, unaffected by any of this)
   news          Google News RSS (public, no key, unaffected by any of this)
+  insider_txns  SEC EDGAR Form 4s (public, no key). Treated like filings/news
+                (always attempted, best-effort) but deliberately left OUT of
+                data_provenance -- it's supplementary signal, not a section
+                with its own live/synthetic badge, so it doesn't need
+                freshness tracking or to grow that table's schema further.
 
 Yahoo's undocumented quoteSummary endpoint (earnings + fundamentals) has
 started getting blocked by Yahoo's anti-bot layer for a large fraction of
@@ -86,6 +91,7 @@ def _needed_fields(ticker: str, provenance: dict[str, dict], force: bool) -> dic
         "fundamentals": not _is_fresh(row.get("fundamentals_updated_at")),
         "filings": True,
         "news": True,
+        "insider_txns": True,
     }
 
 
@@ -98,7 +104,7 @@ def _fetch_live_ticker(ticker: str, company_name: str, need: dict[str, bool]) ->
     others or the thread pool."""
     result: dict = {
         "ticker": ticker, "bars": None, "earnings": None, "filings": None,
-        "news": None, "fundamentals": None, "sources": {},
+        "news": None, "fundamentals": None, "insider_txns": None, "sources": {},
     }
 
     if need["bars"]:
@@ -142,6 +148,15 @@ def _fetch_live_ticker(ticker: str, company_name: str, need: dict[str, bool]) ->
         except Exception as e:
             log.warning("live news fetch failed for %s: %s", ticker, e)
 
+    if need["insider_txns"]:
+        try:
+            result["insider_txns"] = secedgar.fetch_insider_transactions(ticker)
+            # Not recorded in result["sources"]: insider_txns isn't one of
+            # db.PROVENANCE_FIELDS (see module docstring) so update_provenance
+            # would just silently drop it anyway.
+        except Exception as e:
+            log.warning("live insider-transactions fetch failed for %s: %s", ticker, e)
+
     if need["fundamentals"]:
         if finnhub.is_configured():
             try:
@@ -179,6 +194,8 @@ def _write_ticker_result(result: dict) -> None:
         db.upsert_news(ticker, result["news"])
     if result["fundamentals"]:
         db.upsert_fundamentals(ticker, result["fundamentals"])
+    if result.get("insider_txns"):
+        db.upsert_insider_transactions(ticker, result["insider_txns"])
     if result["sources"]:
         db.update_provenance(ticker, result["sources"])
 
@@ -192,6 +209,7 @@ def _ingest_demo_all() -> None:
         db.upsert_filings(ticker, bundle["filings"])
         db.upsert_news(ticker, bundle["news"])
         db.upsert_fundamentals(ticker, demo.generate_fundamentals(ticker))
+        db.upsert_insider_transactions(ticker, demo.generate_insider_transactions(ticker))
         db.update_provenance(ticker, {f: "demo" for f in db.PROVENANCE_FIELDS})
 
 
@@ -242,7 +260,8 @@ def run_ingestion(force: bool = False) -> dict:
                         log.warning("unexpected error fetching %s: %s", c.ticker, e)
                         result = {
                             "ticker": c.ticker, "bars": None, "earnings": None,
-                            "filings": None, "news": None, "fundamentals": None, "sources": {},
+                            "filings": None, "news": None, "fundamentals": None,
+                            "insider_txns": None, "sources": {},
                         }
                     upcoming = bulk_calendar.get(c.ticker)
                     if upcoming and needs[c.ticker]["earnings"]:
@@ -284,6 +303,16 @@ def run_ingestion(force: bool = False) -> dict:
                     missing_fundamentals = n["fundamentals"] and not r["fundamentals"]
                     missing_filings = n["filings"] and not r["filings"]
                     missing_news = n["news"] and not r["news"]
+                    # insider_txns is deliberately NOT part of this check: an
+                    # empty result there usually just means the company had
+                    # no open-market insider buys/sells in its last 20
+                    # filings, which is a legitimate real answer, not a fetch
+                    # failure. Treating it as a gap would trigger full
+                    # synthetic-universe regeneration on nearly every auto-
+                    # mode run (most tickers have no recent Form 4 P/S
+                    # activity) for no benefit -- it's backfilled separately
+                    # below, per-ticker, without needing the expensive full
+                    # demo bundle.
                     if missing_bars or missing_earnings or missing_fundamentals or missing_filings or missing_news:
                         gaps[t] = r
                 if gaps:
@@ -313,6 +342,17 @@ def run_ingestion(force: bool = False) -> dict:
                             db.upsert_fundamentals(ticker, demo.generate_fundamentals(ticker))
                             demo_sources["fundamentals"] = "demo"
                         db.update_provenance(ticker, demo_sources)
+
+                # Insider-transaction backfill is independent of `gaps` above
+                # (see the comment there) and doesn't need the full synthetic
+                # universe bundle, so it's a cheap per-ticker pass over every
+                # result rather than something gated on the expensive
+                # generate_universe_demo_data() call.
+                for ticker, result in results.items():
+                    if needs[ticker]["insider_txns"] and not result.get("insider_txns"):
+                        db.upsert_insider_transactions(
+                            ticker, demo.generate_insider_transactions(ticker)
+                        )
                 db.set_meta(
                     "data_mode_active",
                     f"auto (live={live_ok}, demo_fallback={live_fail})" if live_fail else "live",

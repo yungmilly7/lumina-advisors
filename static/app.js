@@ -1863,6 +1863,15 @@ function renderDetail(d) {
       .map((f) => `<div class="filing-item"><span>${f.form_type}</span><span>${fmtDate(f.filed_date)}</span></div>`)
       .join("") || `<div class="hint">No recent filings.</div>`;
 
+  const insiderHTML =
+    (d.insider_transactions || [])
+      .slice(0, 8)
+      .map((i) => {
+        const isBuy = i.transaction_code === "P";
+        return `<div class="filing-item"><span class="${isBuy ? "dir-up" : "dir-down"}">${isBuy ? "Buy" : "Sell"} · ${i.owner_name}</span><span>${fmtDate(i.transaction_date)} · $${Math.round(i.value_usd).toLocaleString()}</span></div>`;
+      })
+      .join("") || `<div class="hint">No open-market insider trades in recent filings.</div>`;
+
   panel.innerHTML = `
     <div class="detail-header">
       <h3>${d.name} <span style="color:var(--text-muted); font-weight:500;">(${d.ticker})</span></h3>
@@ -1904,6 +1913,9 @@ function renderDetail(d) {
 
     <div class="section-title">Recent filings${sourceBadge(d, "filings")}</div>
     ${filingsHTML}
+
+    <div class="section-title">Insider transactions (open-market)</div>
+    ${insiderHTML}
 
     <div class="section-title">Recent headlines${sourceBadge(d, "news")}</div>
     ${newsHTML}

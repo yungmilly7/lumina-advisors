@@ -237,6 +237,71 @@ def _earnings_features(dates: pd.DatetimeIndex) -> tuple[pd.DataFrame, pd.DataFr
     return days_to_next.fillna(999), days_since_last.fillna(999), last_surprise
 
 
+def _insider_features(dates: pd.DatetimeIndex) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Trailing 90-calendar-day insider open-market buy/sell signal, built
+    only from Form 4 transaction codes P (open-market purchase) and S
+    (open-market sale) -- see app.dataclients.secedgar._parse_form4_xml for
+    why the other codes (grants, tax withholding, option exercises, gifts)
+    are excluded before this ever reaches the DB.
+
+    net_buy_ratio is dollar-weighted and ranges -1 (all selling) to +1 (all
+    buying), 0 when there's no insider activity in the window at all --
+    academic insider-trading research consistently finds open-market buys
+    carry more signal than sells (routine diversification/tax reasons drive
+    a lot of selling, but insiders only buy on the open market when they
+    believe the stock is undervalued), so this is deliberately signed rather
+    than a raw net-shares count.
+
+    Vectorized with searchsorted + padded cumulative sums, mirroring
+    _filing_recency_features/_earnings_features above."""
+    net_buy_ratio = pd.DataFrame(0.0, index=dates, columns=TICKERS)
+    buy_count = pd.DataFrame(0.0, index=dates, columns=TICKERS)
+    dates_arr = dates.values  # datetime64[ns], ascending
+    window_start = dates_arr - np.timedelta64(90, "D")
+
+    for t in TICKERS:
+        rows = db.get_insider_transactions(t, limit=200)
+        if not rows:
+            continue
+        txn_dates, signed_val, abs_val, is_buy = [], [], [], []
+        for r in rows:
+            if not r["transaction_date"] or r["transaction_code"] not in ("P", "S"):
+                continue
+            value = float(r["value_usd"] or 0.0)
+            txn_dates.append(pd.Timestamp(r["transaction_date"]))
+            signed_val.append(value if r["transaction_code"] == "P" else -value)
+            abs_val.append(value)
+            is_buy.append(1.0 if r["transaction_code"] == "P" else 0.0)
+        if not txn_dates:
+            continue
+
+        order = np.argsort(txn_dates)
+        txn_sorted = np.array(txn_dates, dtype="datetime64[ns]")[order]
+        signed_sorted = np.array(signed_val)[order]
+        abs_sorted = np.array(abs_val)[order]
+        buy_sorted = np.array(is_buy)[order]
+
+        # Padded cumulative sums so a trailing-window sum is one subtraction
+        # (cumsum_padded[end] - cumsum_padded[start]), with the leading 0
+        # making "no transactions yet" resolve to 0 instead of needing a
+        # special case.
+        signed_cum = np.concatenate([[0.0], np.cumsum(signed_sorted)])
+        abs_cum = np.concatenate([[0.0], np.cumsum(abs_sorted)])
+        buy_cum = np.concatenate([[0.0], np.cumsum(buy_sorted)])
+
+        end_idx = np.searchsorted(txn_sorted, dates_arr, side="right")
+        start_idx = np.searchsorted(txn_sorted, window_start, side="right")
+
+        window_signed = signed_cum[end_idx] - signed_cum[start_idx]
+        window_abs = abs_cum[end_idx] - abs_cum[start_idx]
+        window_buy_count = buy_cum[end_idx] - buy_cum[start_idx]
+
+        net_buy_ratio[t] = np.where(window_abs > 0, window_signed / np.where(window_abs > 0, window_abs, 1.0), 0.0)
+        buy_count[t] = window_buy_count
+
+    return net_buy_ratio, buy_count
+
+
 @dataclass
 class FeaturePanel:
     close: pd.DataFrame
@@ -329,6 +394,10 @@ def build_feature_panel() -> FeaturePanel:
     filing_days_since, filing_trailing_count = _filing_recency_features(dates)
     features["days_since_filing"] = filing_days_since
     features["filing_count_30d"] = filing_trailing_count
+
+    insider_net_buy_ratio, insider_buy_count = _insider_features(dates)
+    features["insider_net_buy_ratio_90d"] = insider_net_buy_ratio
+    features["insider_buy_count_90d"] = insider_buy_count
 
     # Sector momentum: mean mom_5 across the sector, excluding self.
     mom5 = features["mom_5"].fillna(0.0)
