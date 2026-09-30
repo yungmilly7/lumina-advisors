@@ -129,6 +129,9 @@ def _market_snapshot(horizon: int) -> str:
 
     sc = scoring.scorecard()
     overall = sc.get("overall", {})
+    wf_overall = sc.get("walk_forward", {}).get("overall", {})
+    wf_hit = wf_overall.get("hit_rate")
+    wf_folds = wf_overall.get("n_folds") or 0
 
     return f"""WHOLE-MARKET SNAPSHOT ({horizon}-trading-day horizon, {n} companies tracked):
   breadth: {up} called UP / {n - up} called DOWN ({_fmt_pct(up / n, 0)} up)
@@ -140,8 +143,9 @@ TOP DECLINERS (by model expected move):
 {chr(10).join(line(f) for f in decliners)}
 MOST CONFIDENT CALLS:
 {chr(10).join(line(f) for f in most_confident)}
-MODEL ACCURACY SCORECARD (honest, walk-forward backtested, out-of-sample):
-  overall: n={overall.get('n', 0)}, direction hit rate={_fmt_pct(overall.get('hit_rate'), 1) if overall.get('hit_rate') is not None else 'n/a'}, mean abs error={_fmt_pct(overall.get('mae'), 2) if overall.get('mae') is not None else 'n/a'}"""
+MODEL ACCURACY SCORECARD (honest, out-of-sample backtest on held-out history):
+  overall: n={overall.get('n', 0)}, direction hit rate={_fmt_pct(overall.get('hit_rate'), 1) if overall.get('hit_rate') is not None else 'n/a'}, mean abs error={_fmt_pct(overall.get('mae'), 2) if overall.get('mae') is not None else 'n/a'}
+  walk-forward check ({wf_folds} sequential re-trained folds across horizons, each tested on data it never trained on): direction hit rate={_fmt_pct(wf_hit, 1) if wf_hit is not None else 'n/a'} -- consistency across folds is what makes the single-split number above trustworthy rather than a fluke of which dates landed in that one holdout"""
 
 
 def _preferences_block(preferences: dict | None) -> str:

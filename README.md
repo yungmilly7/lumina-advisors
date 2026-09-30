@@ -95,8 +95,10 @@ app/
                    universe's pooled history, decomposed into per-feature
                    contributions at inference time for the rationale, with
                    an optional Claude API call for a plain-English narrative
-  scoring.py       walk-forward backtest -- scores the frozen model against
-                   a held-out slice of history it never trained on
+  scoring.py       scores the frozen model against a held-out slice of
+                   history it never trained on, plus a separate genuine
+                   walk-forward validation (several re-trained folds) that
+                   checks whether that single split's number is real
   engine.py        in-process singleton wiring it all together for the API
   httpserver.py    a minimal router + server on the standard library's
                    http.server -- see "Why zero dependencies" below
@@ -375,6 +377,44 @@ This is deliberately **not** wired into `render.yaml` / the public Render
 deployment -- it's meant to stay a local, opt-in experiment against your
 own paper account on your own machine, not something every visitor to the
 public demo shares or can affect.
+
+## Walk-forward validation
+
+The scorecard tab's headline numbers (and `scoring.run_backtest`) come from
+scoring the actual production model -- the one forecasts are served from --
+against a single chronological train/test split: roughly the first 85% of
+history to fit, the last 15% held out, with a purge gap of `horizon`
+trading days at the boundary so no training label's forward-return window
+reaches into the holdout (see `signals.split_boundary_dates`). That's a
+real, leakage-free out-of-sample score, but it's still one number from one
+split -- if that particular holdout window happened to be an unusually easy
+or hard stretch of the market, the number would be misleading either way
+without any way to tell.
+
+`scoring.run_walk_forward_backtest` (`signals.walk_forward_splits`) exists
+to answer exactly that question. It carves the most recent half of history
+into several sequential test windows and walks forward through them: fold 0
+trains on everything up through a purge gap before the first window and
+tests on it; fold 1 trains on everything up through fold 0's test window
+(an *expanding* window -- it never forgets earlier folds' history) and
+tests on the next one; and so on, by default 5 folds per horizon, each
+scored by a fresh model fit just for that fold and then discarded --
+walk-forward validation is checking the *method*, not producing a model
+anyone actually uses. If hit rates are consistent fold to fold, the single
+split's headline number is real and repeatable; if they swing wildly, that
+inconsistency is the whole point of running this at all. Both the
+per-fold results and the aggregate are on the scorecard tab and in
+`/api/scorecard`'s `walk_forward` key.
+
+This is also the one place in the bootstrap pipeline that deliberately runs
+*after* the site is already serving traffic, rather than inline like
+everything else. Fitting 5 extra models per horizon roughly doubles a
+bootstrap's total time in local testing -- fine for periodic validation,
+not something the site's cold-boot response time (see the Render sleep/wake
+behavior in `DEPLOY.md`) should ever wait on. `Engine.bootstrap()` kicks it
+off on a background thread once `ready=True`, so the very first request
+(and every 4-hourly scheduled refresh) is never blocked on it; the
+walk-forward numbers just fill in a few/several seconds later.
 
 ## Honest limitations
 

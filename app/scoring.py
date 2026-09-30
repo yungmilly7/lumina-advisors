@@ -1,14 +1,27 @@
-"""Walk-forward scorecard: how good is the model actually?
+"""Scorecard: how good is the model actually?
 
-Reuses the exact same chronological train/test split `forecast.train_models`
-used (roughly the first 85% of history to fit, the last 15% held out, with
-a purge gap of `horizon` trading days at the boundary -- see
-signals.split_boundary_dates) so there's no leakage -- the held-out slice
-was never seen during fitting, and no training label reaches into it. For
-every (ticker, date) row in that held-out slice we already know the real
-outcome (it's history), so we can score the frozen model against it
-immediately instead of waiting for real time to pass, and store the
-results the same way we would for live forecasts that mature later.
+Two distinct validations live here, and it matters which one a given number
+comes from:
+
+- `run_backtest` scores the actual production model (the one forecasts are
+  served from) against the single chronological train/test split
+  `forecast.train_models` used to fit it (roughly the first 85% of history,
+  the last 15% held out, with a purge gap of `horizon` trading days at the
+  boundary -- see signals.split_boundary_dates), so there's no leakage: the
+  held-out slice was never seen during fitting, and no training label
+  reaches into it. For every (ticker, date) row in that held-out slice we
+  already know the real outcome (it's history), so we can score the frozen
+  model against it immediately instead of waiting for real time to pass,
+  and store the results the same way we would for live forecasts that
+  mature later.
+
+- `run_walk_forward_backtest` answers a different question: was that one
+  split's number representative, or did the model just get a lucky (or
+  unlucky) draw of holdout dates? It re-fits several *disposable* models,
+  each on its own expanding window, and walks forward through a sequence of
+  test windows the way `run_backtest`'s single split never does. See
+  signals.walk_forward_splits for the fold construction. Its results never
+  touch the production model -- they exist purely to validate the method.
 """
 from __future__ import annotations
 
@@ -17,10 +30,14 @@ import logging
 import numpy as np
 
 from app import db
-from app.forecast import ForecastModels
-from app.signals import FeaturePanel, split_boundary_dates
+from app.forecast import ForecastModels, fit_direction_and_magnitude, MIN_TRAIN_ROWS
+from app.signals import FeaturePanel, split_boundary_dates, walk_forward_splits
 
 log = logging.getLogger("stockgraph.scoring")
+
+MIN_FOLD_TEST_ROWS = 20
+DEFAULT_WALK_FORWARD_FOLDS = 5
+DEFAULT_WALK_FORWARD_MIN_TRAIN_FRAC = 0.5
 
 
 def run_backtest(panel: FeaturePanel, models: ForecastModels) -> dict:
@@ -78,9 +95,92 @@ def run_backtest(panel: FeaturePanel, models: ForecastModels) -> dict:
     return summary
 
 
+def run_walk_forward_backtest(
+    panel: FeaturePanel,
+    horizons: list[int],
+    n_folds: int = DEFAULT_WALK_FORWARD_FOLDS,
+    min_train_frac: float = DEFAULT_WALK_FORWARD_MIN_TRAIN_FRAC,
+) -> dict:
+    """Genuine walk-forward validation: for each horizon, repeatedly fits a
+    fresh model on an expanding training window and scores it on the very
+    next slice of dates it never saw, walking forward through several such
+    folds -- see the module docstring for how this differs from
+    `run_backtest` above, and signals.walk_forward_splits for how the folds
+    themselves are carved out.
+
+    Every fold's models are fit here and discarded; they're never stored,
+    never used for live forecasts, and don't touch `ForecastModels` at all.
+    This exists purely to validate that the production model's single-split
+    holdout number is representative rather than a fluke, so it's naturally
+    much more expensive than `run_backtest` (n_folds separate model fits
+    per horizon instead of one) -- fine for a background bootstrap, not
+    something to run per-request.
+    """
+    feature_cols = list(panel.features.keys())
+    long_df = panel.as_long_frame(horizons).sort_values("date")
+    evaluated_at = db.now_iso()
+    fold_rows = []
+
+    for h in horizons:
+        df = long_df.dropna(subset=[f"fwd_ret_{h}"]).copy()
+        if len(df) < MIN_TRAIN_ROWS:
+            continue
+
+        dates = df["date"]
+        X = df[feature_cols].to_numpy(dtype=float)
+        y_dir = df[f"fwd_dir_{h}"].to_numpy(dtype=float)
+        y_ret = df[f"fwd_ret_{h}"].to_numpy(dtype=float)
+
+        for fold_idx, train_end_date, test_start_date, test_end_date in walk_forward_splits(
+            dates, h, n_folds=n_folds, min_train_frac=min_train_frac
+        ):
+            train_mask = (dates <= train_end_date).to_numpy()
+            test_mask = ((dates >= test_start_date) & (dates <= test_end_date)).to_numpy()
+            n_train, n_test = int(train_mask.sum()), int(test_mask.sum())
+            if n_train < MIN_TRAIN_ROWS or n_test < MIN_FOLD_TEST_ROWS:
+                continue
+
+            dir_pipe, mag_pipe = fit_direction_and_magnitude(
+                X[train_mask], y_dir[train_mask], y_ret[train_mask]
+            )
+
+            X_test = X[test_mask]
+            direction_correct = dir_pipe.predict(X_test) == y_dir[test_mask]
+            hit_rate = float(direction_correct.mean())
+            mae = float(np.mean(np.abs(mag_pipe.predict(X_test) - y_ret[test_mask])))
+
+            fold_rows.append(
+                {
+                    "horizon_days": int(h),
+                    "fold_index": fold_idx,
+                    "train_end": train_end_date.strftime("%Y-%m-%d"),
+                    "test_start": test_start_date.strftime("%Y-%m-%d"),
+                    "test_end": test_end_date.strftime("%Y-%m-%d"),
+                    "n": n_test,
+                    "hit_rate": hit_rate,
+                    "mae": mae,
+                    "evaluated_at": evaluated_at,
+                }
+            )
+            log.info(
+                "walk-forward horizon=%sd fold=%d n_train=%d n_test=%d hit_rate=%.3f mae=%.4f "
+                "(train_end=%s test=%s..%s)",
+                h, fold_idx, n_train, n_test, hit_rate, mae,
+                train_end_date.date(), test_start_date.date(), test_end_date.date(),
+            )
+
+    db.replace_walk_forward_folds(fold_rows)
+    return {"n_folds_scored": len(fold_rows)}
+
+
 def scorecard() -> dict:
     return {
         "overall": db.scorecard_summary(),
         "by_horizon": [dict(r) for r in db.scorecard_by_horizon()],
         "by_ticker": [dict(r) for r in db.scorecard_by_ticker()],
+        "walk_forward": {
+            "overall": db.walk_forward_summary(),
+            "by_horizon": [dict(r) for r in db.walk_forward_by_horizon()],
+            "folds": [dict(r) for r in db.walk_forward_folds()],
+        },
     }

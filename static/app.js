@@ -1810,16 +1810,19 @@ function fundamentalsHTML(fd) {
 // per-company, per-field replacement for one global "SYNTHETIC DEMO DATA"
 // banner (see renderModeBadge above, which still covers the whole-site
 // summary case).
-// This company's own walk-forward track record (see db.get_ticker_scorecard /
+// This company's own out-of-sample track record (see db.get_ticker_scorecard /
 // forecast_detail's "track_record" field) -- grounds the current call in how
 // the model has actually done on this specific ticker before, rather than
-// only the site-wide scorecard aggregate.
+// only the site-wide scorecard aggregate. This is the production model's
+// single held-out split, not the separate multi-fold walk-forward
+// validation (see the Scorecard tab), which validates the method rather
+// than tracking any one company.
 function trackRecordHTML(tr) {
   if (!tr || !tr.n) {
     return `<p class="hint track-record-hint">No track record yet for this company — not enough backtest history to score it.</p>`;
   }
   const cls = tr.hit_rate >= 0.5 ? "ct-up" : "ct-down";
-  return `<p class="hint track-record-hint">Track record: <span class="${cls}">${fmtPct(tr.hit_rate, 0)} direction accuracy</span> over ${tr.n} past model calls on this company (avg error ${fmtPct(tr.mae, 2)}) — from the walk-forward backtest, not a guarantee.</p>`;
+  return `<p class="hint track-record-hint">Track record: <span class="${cls}">${fmtPct(tr.hit_rate, 0)} direction accuracy</span> over ${tr.n} past model calls on this company (avg error ${fmtPct(tr.mae, 2)}) — from the out-of-sample backtest, not a guarantee.</p>`;
 }
 
 function sourceBadge(d, field) {
@@ -1990,6 +1993,27 @@ function renderScorecard() {
       selectTicker(tr.dataset.ticker);
     });
   });
+
+  const wf = sc.walk_forward || {};
+  const wfOverall = wf.overall || {};
+  const wfSummaryEl = document.getElementById("walkForwardSummary");
+  if (wfSummaryEl) {
+    wfSummaryEl.innerHTML = `
+      <div class="score-card"><div class="label">Folds validated</div><div class="value">${wfOverall.n_folds ?? 0}</div></div>
+      <div class="score-card"><div class="label">Avg. fold hit rate</div><div class="value">${wfOverall.hit_rate != null ? fmtPct(wfOverall.hit_rate, 1) : "—"}</div></div>
+      <div class="score-card"><div class="label">Worst / best fold</div><div class="value">${wfOverall.worst_fold_hit_rate != null ? fmtPct(wfOverall.worst_fold_hit_rate, 0) : "—"} / ${wfOverall.best_fold_hit_rate != null ? fmtPct(wfOverall.best_fold_hit_rate, 0) : "—"}</div></div>
+    `;
+  }
+
+  const fBody = document.querySelector("#scByFold tbody");
+  if (fBody) {
+    fBody.innerHTML = (wf.folds || [])
+      .map(
+        (r) =>
+          `<tr><td>${r.horizon_days}d</td><td>${r.fold_index + 1}</td><td>${fmtDate(r.train_end)}</td><td>${fmtDate(r.test_start)} – ${fmtDate(r.test_end)}</td><td>${r.n}</td><td>${fmtPct(r.hit_rate, 1)}</td><td>${fmtPct(r.mae, 2)}</td></tr>`
+      )
+      .join("") || `<tr><td colspan="7" class="hint">No walk-forward folds scored yet.</td></tr>`;
+  }
 }
 
 // ---------- chat widget ----------

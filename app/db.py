@@ -84,6 +84,19 @@ CREATE TABLE IF NOT EXISTS forecast_outcomes (
     PRIMARY KEY (ticker, as_of, horizon_days)
 );
 
+CREATE TABLE IF NOT EXISTS walk_forward_folds (
+    horizon_days INTEGER NOT NULL,
+    fold_index INTEGER NOT NULL,
+    train_end TEXT,
+    test_start TEXT,
+    test_end TEXT,
+    n INTEGER,
+    hit_rate REAL,
+    mae REAL,
+    evaluated_at TEXT,
+    PRIMARY KEY (horizon_days, fold_index)
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -698,11 +711,15 @@ def scorecard_by_ticker() -> list[sqlite3.Row]:
 
 def get_ticker_scorecard(ticker: str) -> dict:
     """Single-ticker version of scorecard_by_ticker() -- this company's own
-    walk-forward track record (n held-out calls, direction hit rate, mean
-    absolute error), for showing next to its live forecast in the detail
-    panel and the Compare tab rather than only in the aggregate scorecard.
-    Returns {} for a ticker with no recorded outcomes yet (e.g. too little
-    price history for a walk-forward split, or newly added this run)."""
+    out-of-sample track record on the production model's single held-out
+    split (n held-out calls, direction hit rate, mean absolute error), for
+    showing next to its live forecast in the detail panel and the Compare
+    tab rather than only in the aggregate scorecard. See
+    walk_forward_summary()/walk_forward_folds() for the separate,
+    multi-fold walk-forward validation of the *method*, which isn't broken
+    out per ticker. Returns {} for a ticker with no recorded outcomes yet
+    (e.g. too little price history for a holdout split, or newly added
+    this run)."""
     row = get_conn().execute(
         """
         SELECT ticker, COUNT(*) AS n, AVG(direction_correct) AS hit_rate,
@@ -712,6 +729,69 @@ def get_ticker_scorecard(ticker: str) -> dict:
         (ticker,),
     ).fetchone()
     return dict(row) if row else {}
+
+
+def replace_walk_forward_folds(rows: list[dict]) -> None:
+    """Overwrites the whole walk-forward-fold table with this run's fold
+    results in one transaction. Unlike forecast_outcomes (which accumulates
+    every scored call ever, so track records grow over time), the folds
+    here are a validation of the *current* model/feature set against the
+    *current* history -- last run's folds used a different training window
+    and, after any feature addition, a different feature set entirely, so
+    keeping stale folds around next to fresh ones would silently mix
+    incomparable numbers into the same average. A clean replace keeps
+    `walk_forward_summary`/`walk_forward_by_horizon` describing only the
+    most recent validation pass."""
+    with tx() as conn:
+        conn.execute("DELETE FROM walk_forward_folds")
+        if rows:
+            conn.executemany(
+                "INSERT INTO walk_forward_folds(horizon_days, fold_index, train_end, "
+                "test_start, test_end, n, hit_rate, mae, evaluated_at) VALUES "
+                "(:horizon_days, :fold_index, :train_end, :test_start, :test_end, "
+                ":n, :hit_rate, :mae, :evaluated_at)",
+                rows,
+            )
+
+
+def walk_forward_summary() -> dict:
+    """Overall walk-forward validation stats, averaged across every scored
+    fold and horizon. hit_rate/mae here are the mean of each fold's own
+    hit_rate/mae (one vote per fold) rather than a sample-weighted average
+    across pooled rows -- deliberately, so one big fold can't drown out
+    what smaller folds show about consistency across time."""
+    row = get_conn().execute(
+        """
+        SELECT COUNT(*) AS n_folds, SUM(n) AS n_predictions,
+               AVG(hit_rate) AS hit_rate, AVG(mae) AS mae,
+               MIN(hit_rate) AS worst_fold_hit_rate, MAX(hit_rate) AS best_fold_hit_rate
+        FROM walk_forward_folds
+        """
+    ).fetchone()
+    return dict(row) if row else {}
+
+
+def walk_forward_by_horizon() -> list[sqlite3.Row]:
+    return get_conn().execute(
+        """
+        SELECT horizon_days, COUNT(*) AS n_folds, SUM(n) AS n_predictions,
+               AVG(hit_rate) AS hit_rate, AVG(mae) AS mae
+        FROM walk_forward_folds GROUP BY horizon_days ORDER BY horizon_days ASC
+        """
+    ).fetchall()
+
+
+def walk_forward_folds(horizon_days: int | None = None) -> list[sqlite3.Row]:
+    """Every individual fold's result, for showing the walk forward one
+    step at a time in the UI rather than only its aggregate."""
+    if horizon_days is not None:
+        return get_conn().execute(
+            "SELECT * FROM walk_forward_folds WHERE horizon_days=? ORDER BY fold_index ASC",
+            (horizon_days,),
+        ).fetchall()
+    return get_conn().execute(
+        "SELECT * FROM walk_forward_folds ORDER BY horizon_days ASC, fold_index ASC"
+    ).fetchall()
 
 
 # ---------- accounts ----------

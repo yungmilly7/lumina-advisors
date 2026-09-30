@@ -35,6 +35,7 @@ class Engine:
         self.forecast_by_ticker: dict[tuple[str, int], dict] = {}
         self.trained_at: str | None = None
         self.backtest_summary: dict = {}
+        self.walk_forward_summary: dict = {}
         self.ingestion_info: dict = {}
         self.ready = False
         self._refresh_thread: threading.Thread | None = None
@@ -71,6 +72,46 @@ class Engine:
                 except Exception as e:
                     log.exception("paper-trading pass failed; forecasts/site are unaffected")
                     self.last_trading_result = {"ran": False, "reason": f"unexpected error: {e}"}
+
+        # Walk-forward validation re-fits several extra disposable models
+        # per horizon (see scoring.run_walk_forward_backtest) -- in local
+        # testing that's roughly as expensive as the rest of a bootstrap
+        # combined. run.py calls bootstrap() synchronously *before* the
+        # HTTP server even starts listening, so anything run inside the
+        # `with self.lock` block above sits directly on this site's
+        # cold-boot latency -- exactly what Render's free-tier sleep/wake
+        # cycle makes painful, and exactly what an earlier pass on this
+        # project already fixed once. Running it here instead, after the
+        # lock is released and `ready` is already True, means the very
+        # first request (and every 4-hourly scheduled refresh) is never
+        # blocked on it -- the walk-forward numbers in the scorecard just
+        # fill in a bit later, same as any other background refresh.
+        self._start_walk_forward_validation(self.panel, self.models)
+
+    def _start_walk_forward_validation(self, panel: FeaturePanel, models: ForecastModels) -> None:
+        def _run() -> None:
+            log.info("walk-forward validation: starting (background)...")
+            try:
+                summary = scoring.run_walk_forward_backtest(panel, list(models.by_horizon.keys()))
+                with self.lock:
+                    # A newer bootstrap() may have already replaced
+                    # self.panel/self.models by the time this finishes --
+                    # don't let a slow, now-stale run overwrite fresher
+                    # results with numbers for a model that's no longer live.
+                    if self.models is models:
+                        self.walk_forward_summary = summary
+                log.info("walk-forward validation: complete (background). %s", summary)
+            except Exception:
+                # Purely a validation/transparency pass on top of the
+                # already-serving production model -- a bug or an
+                # unusually short history here should never affect the
+                # site itself, which bootstrapped successfully already.
+                log.exception("walk-forward validation failed (background); scorecard will show stale/empty walk-forward stats")
+                with self.lock:
+                    if self.models is models:
+                        self.walk_forward_summary = {"error": "walk-forward validation failed"}
+
+        threading.Thread(target=_run, name="stockgraph-walkforward", daemon=True).start()
 
     def start_background_refresh(self, interval_hours: float = REFRESH_INTERVAL_HOURS) -> None:
         """Periodically re-runs the full bootstrap (ingest -> features ->
@@ -162,6 +203,7 @@ class Engine:
                     for h, hm in (self.models.by_horizon.items() if self.models else [])
                 },
                 "backtest_summary": {str(k): v for k, v in self.backtest_summary.items()},
+                "walk_forward_summary": self.walk_forward_summary,
                 "refresh_interval_hours": self.refresh_interval_hours,
                 "last_refresh_error": self.last_refresh_error,
                 "trading_enabled": trading.enabled(),

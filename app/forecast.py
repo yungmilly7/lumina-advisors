@@ -103,6 +103,25 @@ class ForecastModels:
     by_horizon: dict[int, HorizonModel] = field(default_factory=dict)
 
 
+MIN_TRAIN_ROWS = 300
+
+
+def fit_direction_and_magnitude(X_train: np.ndarray, ydir_train: np.ndarray, yret_train: np.ndarray) -> tuple[Pipeline, Pipeline]:
+    """Fits a fresh (direction classifier, magnitude regressor) pair with
+    the exact hyperparameters the production model uses. Pulled out of
+    train_models so scoring.run_walk_forward_backtest can fit the same kind
+    of model, fold by fold, on each fold's own expanding training window
+    without duplicating (and risking drifting) these hyperparameters."""
+    dir_pipe = Pipeline(
+        [("scaler", StandardScaler()), ("clf", LogisticRegression(alpha=2.0, lr=0.5, iterations=LOGISTIC_ITERATIONS))]
+    )
+    dir_pipe.fit(X_train, ydir_train)
+
+    mag_pipe = Pipeline([("scaler", StandardScaler()), ("reg", RidgeRegression(alpha=8.0))])
+    mag_pipe.fit(X_train, yret_train)
+    return dir_pipe, mag_pipe
+
+
 def train_models(panel: FeaturePanel, horizons: list[int] = HORIZONS) -> ForecastModels:
     feature_cols = list(panel.features.keys())
     long_df = panel.as_long_frame(horizons).sort_values("date")
@@ -110,7 +129,7 @@ def train_models(panel: FeaturePanel, horizons: list[int] = HORIZONS) -> Forecas
 
     for h in horizons:
         df = long_df.dropna(subset=[f"fwd_ret_{h}"]).copy()
-        if len(df) < 300:
+        if len(df) < MIN_TRAIN_ROWS:
             log.warning("not enough rows to train horizon=%sd (%d rows)", h, len(df))
             continue
 
@@ -123,6 +142,15 @@ def train_models(panel: FeaturePanel, horizons: list[int] = HORIZONS) -> Forecas
         # into the future, so without the gap, rows just before the
         # boundary would have labels computed from prices inside the
         # nominally held-out test window. See signals.split_boundary_dates.
+        #
+        # This single split is what the production model is actually
+        # fit and scored on. It is NOT, by itself, a walk-forward
+        # validation -- one split is one data point about how well the
+        # model generalizes. scoring.run_walk_forward_backtest separately
+        # re-fits this same kind of model across several sequential
+        # expanding-window folds (see signals.walk_forward_splits) purely
+        # to check whether this one split's holdout numbers are
+        # representative or a fluke of which dates happened to land in it.
         train_end_date, test_start_date = split_boundary_dates(df["date"], h)
         train_mask = (df["date"] <= train_end_date).to_numpy()
         test_mask = (df["date"] >= test_start_date).to_numpy()
@@ -131,13 +159,7 @@ def train_models(panel: FeaturePanel, horizons: list[int] = HORIZONS) -> Forecas
         ydir_train, ydir_test = y_dir[train_mask], y_dir[test_mask]
         yret_train, yret_test = y_ret[train_mask], y_ret[test_mask]
 
-        dir_pipe = Pipeline(
-            [("scaler", StandardScaler()), ("clf", LogisticRegression(alpha=2.0, lr=0.5, iterations=LOGISTIC_ITERATIONS))]
-        )
-        dir_pipe.fit(X_train, ydir_train)
-
-        mag_pipe = Pipeline([("scaler", StandardScaler()), ("reg", RidgeRegression(alpha=8.0))])
-        mag_pipe.fit(X_train, yret_train)
+        dir_pipe, mag_pipe = fit_direction_and_magnitude(X_train, ydir_train, yret_train)
 
         if len(X_test) > 20:
             acc = float((dir_pipe.predict(X_test) == ydir_test).mean())

@@ -197,7 +197,7 @@
   <section id="tab-scorecard" class="tab-panel">
     <div class="panel-head">
       <h2>Model scorecard</h2>
-      <p class="hint">Walk-forward accuracy on data the model never trained on. This is the honest measure of whether the forecasts are worth anything — read it before trusting any single prediction.</p>
+      <p class="hint">Out-of-sample accuracy on data the model never trained on. This is the honest measure of whether the forecasts are worth anything — read it before trusting any single prediction.</p>
     </div>
     <div id="scorecardSummary" class="score-summary"></div>
     <div class="chart-panel">
@@ -221,6 +221,14 @@
           <table class="data-table" id="scByTicker"><thead><tr><th>Ticker</th><th title="Number of held-out predictions this is based on">N</th><th title="Share of held-out predictions where the model got the up/down direction right">Hit rate</th><th title="Mean absolute error -- average difference between predicted and actual price move, in percentage points">MAE</th></tr></thead><tbody></tbody></table>
         </div>
       </div>
+    </div>
+    <div class="panel-head">
+      <h3>Walk-forward validation</h3>
+      <p class="hint">The table above scores the one model this site actually serves forecasts from, on a single held-out slice of history. To check whether that single number is representative rather than a lucky draw, this re-trains a fresh, disposable model on an expanding window and re-tests it on the next slice of time it never saw, several times in a row per horizon. Consistent hit rates fold-to-fold mean the model's skill is real and repeatable, not a fluke of which dates happened to land in one holdout.</p>
+    </div>
+    <div id="walkForwardSummary" class="score-summary"></div>
+    <div class="table-wrap">
+      <table class="data-table" id="scByFold"><thead><tr><th>Horizon</th><th>Fold</th><th title="Last date included in that fold's training window">Train through</th><th title="Date range scored, never seen during that fold's training">Test window</th><th title="Number of held-out predictions this fold is based on">N</th><th title="Share of this fold's held-out predictions where the model got the up/down direction right">Hit rate</th><th title="Mean absolute error for this fold">MAE</th></tr></thead><tbody></tbody></table>
     </div>
   </section>
 

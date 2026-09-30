@@ -481,6 +481,58 @@ def split_boundary_dates(dates, horizon: int, train_frac: float = 0.85):
     return dates[train_end_idx], dates[test_start_idx]
 
 
+def walk_forward_splits(dates, horizon: int, n_folds: int = 5, min_train_frac: float = 0.5):
+    """Yields (fold_index, train_end_date, test_start_date, test_end_date)
+    tuples for genuine walk-forward validation.
+
+    split_boundary_dates above gives a single chronological split -- one
+    fixed point where everything before is "train" and everything after is
+    "test". That's what the production model is actually fit on, but a
+    single split is one data point about how well it generalizes: if that
+    one holdout window happened to be an unusually easy or hard stretch of
+    the market, the number is misleading either way.
+
+    This instead carves the most recent `(1 - min_train_frac)` share of
+    history into `n_folds` sequential, non-overlapping test windows and
+    walks forward through them: fold 0 trains on everything up through the
+    end of the "training-only" region and tests on the first window right
+    after it; fold 1 trains on everything up through the end of fold 0's
+    test window (an *expanding* window -- it never forgets earlier folds'
+    data, since a real trader validating this way would keep accumulating
+    history) and tests on the next window; and so on. Every fold reuses the
+    same `horizon`-day purge gap as split_boundary_dates, for the identical
+    label-leakage reason, and every fold's test window is data that fold's
+    own training window never saw.
+
+    Consistent hit rates across folds mean the single split's number
+    reflects real, repeatable skill. Hit rates that swing wildly fold to
+    fold mean the model (or the single split) got lucky/unlucky once,
+    which the single split alone could never reveal.
+    """
+    dates = pd.DatetimeIndex(sorted(pd.Index(dates).unique()))
+    n = len(dates)
+    first_test_idx = max(int(n * min_train_frac), 1)
+    test_region_len = n - first_test_idx
+    if test_region_len < 2:
+        return
+    n_folds = max(1, min(n_folds, test_region_len // 2))
+    fold_size = max(test_region_len // n_folds, 1)
+
+    for fold in range(n_folds):
+        test_start_idx = first_test_idx + fold * fold_size
+        if test_start_idx >= n:
+            break
+        # Last fold soaks up any remainder so the folds always cover the
+        # entire test region rather than dropping a few trailing dates.
+        test_end_idx = n - 1 if fold == n_folds - 1 else min(test_start_idx + fold_size, n) - 1
+        if test_end_idx < test_start_idx:
+            continue
+        train_end_idx = max(test_start_idx - horizon, 0)
+        if train_end_idx < 1:
+            continue
+        yield fold, dates[train_end_idx], dates[test_start_idx], dates[test_end_idx]
+
+
 def build_feature_panel() -> FeaturePanel:
     close, volume, high, low, dates = _load_price_panel()
     if close.empty:

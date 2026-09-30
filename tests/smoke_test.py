@@ -694,6 +694,143 @@ class TestXbrlDbDemoAndPipeline(unittest.TestCase):
         self.assertTrue(all(needs.values()))
 
 
+class TestWalkForwardValidation(unittest.TestCase):
+    """signals.walk_forward_splits + scoring.run_walk_forward_backtest --
+    see scoring.py's module docstring for why this is a separate validation
+    from the single-split backtest scored in TestPipelineAndModels above."""
+
+    def test_splits_are_sequential_expanding_and_gap_respected(self):
+        from app.signals import walk_forward_splits
+
+        dates = pd.date_range("2024-01-01", periods=400, freq="B")
+        horizon = 20
+        folds = list(walk_forward_splits(dates, horizon, n_folds=5, min_train_frac=0.5))
+        self.assertEqual(len(folds), 5)
+
+        prev_test_end = None
+        prev_train_end = None
+        for fold_idx, train_end, test_start, test_end in folds:
+            self.assertLessEqual(train_end, test_start)
+            self.assertLessEqual(test_start, test_end)
+            # The purge gap between a fold's training cutoff and its test
+            # window must be exactly `horizon` trading days -- same
+            # look-ahead-bias reasoning as split_boundary_dates.
+            gap = dates.get_loc(test_start) - dates.get_loc(train_end)
+            self.assertEqual(gap, horizon)
+            if prev_test_end is not None:
+                self.assertGreater(test_start, prev_test_end)  # non-overlapping, sequential
+            if prev_train_end is not None:
+                self.assertGreaterEqual(train_end, prev_train_end)  # expanding window
+            prev_test_end, prev_train_end = test_end, train_end
+
+        # The folds should cover all the way through the end of history,
+        # not silently drop trailing dates.
+        self.assertEqual(folds[-1][3], dates[-1])
+
+    def test_too_little_history_degrades_gracefully_instead_of_erroring(self):
+        from app.signals import walk_forward_splits
+
+        dates = pd.date_range("2024-01-01", periods=10, freq="B")
+        # Deliberately not enough history for 5 folds with a 5-day purge
+        # gap apiece -- this must shrink/skip folds rather than raise or
+        # yield a nonsensical (train_end >= test_start) split.
+        folds = list(walk_forward_splits(dates, horizon=5, n_folds=5, min_train_frac=0.5))
+        self.assertLessEqual(len(folds), 5)
+        for _, train_end, test_start, test_end in folds:
+            self.assertLess(train_end, test_start)
+            self.assertLessEqual(test_start, test_end)
+
+    def test_run_walk_forward_backtest_produces_plausible_scored_folds(self):
+        from app import db, scoring
+        from app.engine import engine
+
+        if not engine.ready:
+            engine.bootstrap()
+        # engine.bootstrap() now kicks off its own walk-forward pass on a
+        # background thread (see Engine._start_walk_forward_validation --
+        # it must never block the site's cold-boot critical path), so
+        # timing-wise it may not have finished yet. Call it directly and
+        # synchronously here instead of racing that thread.
+        scoring.run_walk_forward_backtest(engine.panel, list(engine.models.by_horizon.keys()))
+
+        folds = db.walk_forward_folds()
+        self.assertGreater(len(folds), 0)
+        for row in folds:
+            self.assertTrue(0.0 <= row["hit_rate"] <= 1.0)
+            self.assertGreater(row["n"], 0)
+            self.assertLess(row["train_end"], row["test_start"])  # ISO dates sort chronologically
+
+        summary = db.walk_forward_summary()
+        self.assertGreater(summary["n_folds"], 0)
+        self.assertTrue(0.0 <= summary["hit_rate"] <= 1.0)
+
+    def test_scorecard_exposes_walk_forward_section(self):
+        from app import scoring
+
+        sc = scoring.scorecard()
+        self.assertIn("walk_forward", sc)
+        self.assertIn("overall", sc["walk_forward"])
+        self.assertIn("by_horizon", sc["walk_forward"])
+        self.assertIn("folds", sc["walk_forward"])
+
+    def test_walk_forward_validation_runs_without_blocking_its_caller(self):
+        # Regression test: walk-forward validation must never sit on
+        # bootstrap()'s critical path -- run.py calls bootstrap() before the
+        # HTTP server even starts listening, so anything synchronous there
+        # directly adds to cold-boot latency (exactly what an earlier
+        # Render.com cold-boot fix on this project was about; see
+        # Engine._start_walk_forward_validation's docstring/comment).
+        # Proves it with a patched, artificially slow implementation rather
+        # than timing the real (expensive) one: if this were ever called
+        # synchronously again, this test would hang until `release` is set
+        # further down and fail the "still running" assertion.
+        import threading
+        import time
+        from unittest.mock import patch
+        from app import scoring
+        from app.engine import engine
+
+        if not engine.ready:
+            engine.bootstrap()
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_fake(panel, horizons):
+            started.set()
+            release.wait(timeout=5)
+            return {"n_folds_scored": 3}
+
+        with patch.object(scoring, "run_walk_forward_backtest", slow_fake):
+            engine._start_walk_forward_validation(engine.panel, engine.models)
+            self.assertTrue(started.wait(timeout=2), "background thread never started")
+            # The call above must have returned already, well before the
+            # patched function is unblocked -- proof it isn't running
+            # synchronously on the caller's thread.
+            self.assertFalse(release.is_set())
+
+        release.set()
+        deadline = time.time() + 5
+        while engine.walk_forward_summary.get("n_folds_scored") != 3 and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(engine.walk_forward_summary.get("n_folds_scored"), 3)
+
+    def test_walk_forward_fold_models_are_disposable(self):
+        # The walk-forward pass fits and discards many temporary models
+        # (one per fold) purely to validate the method -- running it again
+        # must never change the actual production model the site serves
+        # forecasts from.
+        from app import scoring
+        from app.engine import engine
+
+        if not engine.ready:
+            engine.bootstrap()
+        before = engine.models.by_horizon[5].holdout_accuracy
+        scoring.run_walk_forward_backtest(engine.panel, list(engine.models.by_horizon.keys()))
+        after = engine.models.by_horizon[5].holdout_accuracy
+        self.assertEqual(before, after)
+
+
 class TestYahooCrumbHandshake(unittest.TestCase):
     """Regression test: fc.yahoo.com's cookie-seed request routinely answers
     with a 404 (it's an edge/accelerator endpoint, not a real page) while
