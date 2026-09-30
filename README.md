@@ -207,10 +207,23 @@ as the 10-K/10-Q/8-K filings already shown. Only transaction codes `P`
 `A` (grants/awards), `F` (tax withholding), `M` (option exercises), and `G`
 (gifts) are compensation/administrative noise by academic convention, not a
 genuine discretionary trading decision, so they're filtered out before this
-ever reaches the model. Like filings and news, it's fetched best-effort on
-every run rather than tracked for "freshness" -- an empty result usually
-just means that company's insiders haven't made an open-market trade
-recently, which is a real, common state, not a fetch failure.
+ever reaches the model. Like filings and news, the per-ticker check for
+*new* filings runs on every ingestion cycle rather than being tracked for
+"freshness" -- an empty result usually just means that company's insiders
+haven't made an open-market trade recently, which is a real, common state,
+not a fetch failure.
+
+Unlike filings, though, each Form 4 costs a *separate* document fetch on top
+of the one list request (parsing the actual transaction requires the
+filing's own XML document, not just its listing entry) -- multiplied across
+448+ companies on every scheduled refresh, indefinitely, an unbounded
+"always re-fetch the last N filings" would mean thousands of redundant SEC
+requests per run for filings whose content never changes once filed. So
+this one genuinely is incremental: `insider_txn_filings_seen` tracks which
+accession numbers have already been fetched+parsed per ticker, and only
+new ones are ever fetched again -- a ticker with a deep backlog catches up
+in bounded batches over its first several runs, and steady state afterward
+is just the 0-2 new Form 4s that typically appear between runs.
 
 ## Macro/market regime signal
 

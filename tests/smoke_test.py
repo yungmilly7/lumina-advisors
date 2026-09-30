@@ -343,10 +343,38 @@ class TestForm4Parsing(unittest.TestCase):
         }
         with patch("app.dataclients.secedgar.get_json", return_value=fake_submissions), \
              patch("app.dataclients.secedgar.get_text", return_value=_SAMPLE_FORM4_XML) as mock_get_text:
-            rows = secedgar.fetch_insider_transactions("TEST", limit_filings=20)
+            rows, fetched_accessions = secedgar.fetch_insider_transactions("TEST", limit_filings=20)
 
         self.assertEqual(mock_get_text.call_count, 2)  # only the two "4" filings
         self.assertEqual(len(rows), 4)  # 2 open-market rows x 2 filings
+        self.assertEqual(len(fetched_accessions), 2)
+
+    def test_fetch_insider_transactions_skips_already_seen_accessions(self):
+        from unittest.mock import patch
+        import app.dataclients.secedgar as secedgar
+
+        secedgar._cik_map_cache = {"TEST": "1234567890"}
+        forms = ["4", "4", "4"]
+        accns = [f"0001234567-26-{i:06d}" for i in range(len(forms))]
+        fake_submissions = {
+            "filings": {
+                "recent": {
+                    "form": forms,
+                    "accessionNumber": accns,
+                    "primaryDocument": [f"doc{i}.xml" for i in range(len(forms))],
+                }
+            }
+        }
+        with patch("app.dataclients.secedgar.get_json", return_value=fake_submissions), \
+             patch("app.dataclients.secedgar.get_text", return_value=_SAMPLE_FORM4_XML) as mock_get_text:
+            rows, fetched_accessions = secedgar.fetch_insider_transactions(
+                "TEST", limit_filings=20, already_seen=frozenset(accns[:2])
+            )
+
+        # Only the one filing not already seen should trigger a document fetch.
+        self.assertEqual(mock_get_text.call_count, 1)
+        self.assertEqual(fetched_accessions, [accns[2]])
+        self.assertEqual(len(rows), 2)  # the 2 open-market rows from that one filing
 
 
 class TestInsiderTransactionsDbAndDemo(unittest.TestCase):
@@ -382,6 +410,17 @@ class TestInsiderTransactionsDbAndDemo(unittest.TestCase):
         stored = db.get_insider_transactions("ZZZZ_TEST", limit=10)
         self.assertEqual(len(stored), 1)
         self.assertEqual(stored[0]["owner_name"], "Test Owner")
+
+    def test_seen_accessions_roundtrip_and_dedup(self):
+        from app import db
+
+        self.assertEqual(db.get_seen_insider_accessions("ZZZZ_ACCN_TEST"), frozenset())
+        db.mark_insider_accessions_seen("ZZZZ_ACCN_TEST", ["0001-26-000001", "0001-26-000002"])
+        db.mark_insider_accessions_seen("ZZZZ_ACCN_TEST", ["0001-26-000002"])  # duplicate, ignored
+        seen = db.get_seen_insider_accessions("ZZZZ_ACCN_TEST")
+        self.assertEqual(seen, frozenset({"0001-26-000001", "0001-26-000002"}))
+        # A different ticker's seen-set is independent.
+        self.assertEqual(db.get_seen_insider_accessions("ZZZZ_OTHER_TEST"), frozenset())
 
 
 _SAMPLE_TREASURY_CSV = (
@@ -987,11 +1026,11 @@ class TestLiveIngestionPartialFailureFallback(unittest.TestCase):
         failing = {COMPANIES[0].ticker, COMPANIES[1].ticker}
         demo_dataset = demo_client.generate_universe_demo_data()
 
-        def fake_fetch(ticker, company_name, need):
+        def fake_fetch(ticker, company_name, need, seen_accessions=frozenset()):
             if ticker in failing:
                 return {"ticker": ticker, "bars": None, "earnings": None,
                          "filings": None, "news": None, "fundamentals": None,
-                         "insider_txns": None, "sources": {}}
+                         "insider_txns": None, "insider_txn_accessions": [], "sources": {}}
             bundle = demo_dataset[ticker]
             return {
                 "ticker": ticker,

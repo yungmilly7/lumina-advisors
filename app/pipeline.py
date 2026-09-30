@@ -101,16 +101,25 @@ def _needed_fields(ticker: str, provenance: dict[str, dict], force: bool) -> dic
     }
 
 
-def _fetch_live_ticker(ticker: str, company_name: str, need: dict[str, bool]) -> dict:
+def _fetch_live_ticker(
+    ticker: str, company_name: str, need: dict[str, bool], seen_accessions: frozenset[str] = frozenset()
+) -> dict:
     """Fetches whichever live data sources `need` marks True and returns
     whatever succeeded, plus a `sources` map recording which provider
     supplied each field that came back -- pure network I/O, no DB access,
     so it's safe to run from a worker thread. Failures are logged and
     simply omitted, never raised, so one bad ticker can't derail the
-    others or the thread pool."""
+    others or the thread pool.
+
+    `seen_accessions` (read from db.get_seen_insider_accessions in the main
+    thread before dispatch, since this function itself can't touch the DB)
+    is which Form 4 accession numbers this ticker has already had fetched
+    and parsed in a previous run -- see fetch_insider_transactions's
+    docstring for why that matters at 448-ticker scale."""
     result: dict = {
         "ticker": ticker, "bars": None, "earnings": None, "filings": None,
-        "news": None, "fundamentals": None, "insider_txns": None, "sources": {},
+        "news": None, "fundamentals": None, "insider_txns": None,
+        "insider_txn_accessions": [], "sources": {},
     }
 
     if need["bars"]:
@@ -156,7 +165,11 @@ def _fetch_live_ticker(ticker: str, company_name: str, need: dict[str, bool]) ->
 
     if need["insider_txns"]:
         try:
-            result["insider_txns"] = secedgar.fetch_insider_transactions(ticker)
+            rows, fetched_accns = secedgar.fetch_insider_transactions(
+                ticker, already_seen=seen_accessions
+            )
+            result["insider_txns"] = rows
+            result["insider_txn_accessions"] = fetched_accns
             # Not recorded in result["sources"]: insider_txns isn't one of
             # db.PROVENANCE_FIELDS (see module docstring) so update_provenance
             # would just silently drop it anyway.
@@ -202,6 +215,8 @@ def _write_ticker_result(result: dict) -> None:
         db.upsert_fundamentals(ticker, result["fundamentals"])
     if result.get("insider_txns"):
         db.upsert_insider_transactions(ticker, result["insider_txns"])
+    if result.get("insider_txn_accessions"):
+        db.mark_insider_accessions_seen(ticker, result["insider_txn_accessions"])
     if result["sources"]:
         db.update_provenance(ticker, result["sources"])
 
@@ -305,10 +320,18 @@ def run_ingestion(force: bool = False) -> dict:
                 except Exception as e:
                     log.warning("finnhub bulk earnings calendar fetch failed: %s", e)
 
+            # Read once, in the main thread, rather than letting the worker
+            # threads touch the DB -- see fetch_insider_transactions's
+            # docstring for why re-fetching already-processed Form 4s is
+            # worth avoiding at this scale.
+            seen_accessions = {c.ticker: db.get_seen_insider_accessions(c.ticker) for c in COMPANIES}
+
             results: dict[str, dict] = {}
             with ThreadPoolExecutor(max_workers=LIVE_FETCH_WORKERS) as pool:
                 futures = {
-                    pool.submit(_fetch_live_ticker, c.ticker, c.name, needs[c.ticker]): c
+                    pool.submit(
+                        _fetch_live_ticker, c.ticker, c.name, needs[c.ticker], seen_accessions[c.ticker]
+                    ): c
                     for c in COMPANIES
                 }
                 for future in as_completed(futures):
@@ -320,7 +343,7 @@ def run_ingestion(force: bool = False) -> dict:
                         result = {
                             "ticker": c.ticker, "bars": None, "earnings": None,
                             "filings": None, "news": None, "fundamentals": None,
-                            "insider_txns": None, "sources": {},
+                            "insider_txns": None, "insider_txn_accessions": [], "sources": {},
                         }
                     upcoming = bulk_calendar.get(c.ticker)
                     if upcoming and needs[c.ticker]["earnings"]:

@@ -123,18 +123,41 @@ def _parse_form4_xml(raw_xml: str) -> list[dict]:
     return rows
 
 
-def fetch_insider_transactions(ticker: str, limit_filings: int = 20) -> list[dict]:
-    """Fetch and parse the most recent Form 4 filings for a ticker.
+def fetch_insider_transactions(
+    ticker: str, limit_filings: int = 10, already_seen: frozenset[str] | None = None
+) -> tuple[list[dict], list[str]]:
+    """Fetch and parse the most recent, not-already-processed Form 4 filings
+    for a ticker.
 
-    Returns a flat list of open-market buy/sell rows (see _parse_form4_xml),
-    newest filings first. Best-effort: any network or parse failure for an
-    individual filing is skipped rather than aborting the whole fetch, since
-    one malformed filing shouldn't cost us every other one.
+    Each Form 4 costs a *separate* document fetch beyond the one submissions-
+    list request every other filing type needs -- multiplied across 448+
+    tickers on every scheduled refresh (every few hours, indefinitely; see
+    app.engine's background refresh), an unbounded "always re-fetch the last
+    N filings" here would mean thousands of redundant SEC requests per run
+    for filings whose content never changes once filed. `already_seen` (the
+    set of accession numbers already fetched+parsed in a previous run -- see
+    app.pipeline._fetch_live_ticker / app.db's insider_txn_filings_seen
+    table) makes this genuinely incremental: only filings not already
+    fetched are ever fetched again. A ticker with a deep backlog catches up
+    `limit_filings` at a time over its first several runs (bounding worst-
+    case cost per run even then); once caught up, steady state is just the
+    0-2 new Form 4s that typically appear between runs, not `limit_filings`.
+
+    Returns (rows, fetched_accessions): `rows` is the flat list of open-
+    market buy/sell rows (see _parse_form4_xml) from filings fetched *this
+    call*, and `fetched_accessions` is every accession number actually
+    fetched this call (whether or not it produced any P/S rows) -- the
+    caller persists these as newly "seen" so they're skipped next time.
+    Best-effort: any network or parse failure for an individual filing is
+    skipped (not added to fetched_accessions, so it'll be retried next run)
+    rather than aborting the whole fetch, since one malformed/unreachable
+    filing shouldn't cost us every other one.
     """
+    already_seen = already_seen or frozenset()
     cik_map = _load_cik_map()
     cik = cik_map.get(ticker.upper())
     if not cik:
-        return []
+        return [], []
     data = get_json(SUBMISSIONS_URL.format(cik=cik), headers=_headers)
 
     recent = data.get("filings", {}).get("recent", {})
@@ -143,9 +166,12 @@ def fetch_insider_transactions(ticker: str, limit_filings: int = 20) -> list[dic
     docs = recent.get("primaryDocument", [])
 
     rows: list[dict] = []
+    fetched_accessions: list[str] = []
     filings_checked = 0
     for i in range(len(forms)):
         if forms[i] != "4":
+            continue
+        if accns[i] in already_seen:
             continue
         if filings_checked >= limit_filings:
             break
@@ -161,7 +187,8 @@ def fetch_insider_transactions(ticker: str, limit_filings: int = 20) -> list[dic
             log.warning("failed to fetch Form 4 document for %s at %s", ticker, url)
             continue
         rows.extend(_parse_form4_xml(raw_xml))
-    return rows
+        fetched_accessions.append(accns[i])
+    return rows, fetched_accessions
 
 
 def fetch_recent_filings(ticker: str, limit: int = 10) -> list[dict]:

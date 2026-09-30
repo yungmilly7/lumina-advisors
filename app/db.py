@@ -217,6 +217,18 @@ CREATE TABLE IF NOT EXISTS insider_transactions (
 );
 CREATE INDEX IF NOT EXISTS idx_insider_txn_ticker_date ON insider_transactions(ticker, transaction_date);
 
+-- Which Form 4 accession numbers have already been fetched+parsed per
+-- ticker, so app.dataclients.secedgar.fetch_insider_transactions never
+-- re-fetches a filing's XML document twice -- a Form 4's content never
+-- changes once filed, so re-fetching it on every scheduled refresh (every
+-- few hours, indefinitely, across 448+ tickers) would be pure waste and
+-- real risk of tripping SEC's rate limiting. See that function's docstring.
+CREATE TABLE IF NOT EXISTS insider_txn_filings_seen (
+    ticker TEXT NOT NULL,
+    accession_number TEXT NOT NULL,
+    PRIMARY KEY (ticker, accession_number)
+);
+
 -- Market-wide (not per-ticker) macro/regime series: VIX close and a few
 -- Treasury par-yield tenors. One row per (series, date) rather than one
 -- column per series so adding another series later (e.g. a credit spread)
@@ -381,6 +393,23 @@ def get_insider_transactions(ticker: str, limit: int = 50) -> list[sqlite3.Row]:
         "ORDER BY transaction_date DESC LIMIT ?",
         (ticker, limit),
     ).fetchall()
+
+
+def get_seen_insider_accessions(ticker: str) -> frozenset[str]:
+    rows = get_conn().execute(
+        "SELECT accession_number FROM insider_txn_filings_seen WHERE ticker=?", (ticker,)
+    ).fetchall()
+    return frozenset(r["accession_number"] for r in rows)
+
+
+def mark_insider_accessions_seen(ticker: str, accessions: list[str]) -> None:
+    if not accessions:
+        return
+    with tx() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO insider_txn_filings_seen(ticker, accession_number) VALUES (?, ?)",
+            [(ticker, a) for a in accessions],
+        )
 
 
 def upsert_macro_series(rows: list[dict]) -> None:
