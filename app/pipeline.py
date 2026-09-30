@@ -18,6 +18,20 @@ Per data category, "live" now means:
                 data_provenance -- it's supplementary signal, not a section
                 with its own live/synthetic badge, so it doesn't need
                 freshness tracking or to grow that table's schema further.
+  xbrl          SEC EDGAR XBRL company-facts (public, no key) -- quarterly
+                revenue/net income history. Unlike insider_txns, this DOES
+                have real freshness semantics (it only changes when a
+                company files a new 10-Q/10-K, so it's tracked in
+                data_provenance with its own XBRL_FRESH_HOURS window, much
+                longer than FRESH_HOURS -- there's no point re-checking
+                quarterly-cadence data every few hours) and its own
+                live/synthetic badge, same as fundamentals. But like
+                insider_txns, an empty result (no matching us-gaap tag --
+                e.g. a foreign private issuer filing under IFRS) is a
+                legitimate state some tickers are just permanently in, so
+                it's deliberately excluded from the "gaps" backfill trigger
+                below to avoid forcing a full synthetic-universe
+                regeneration for every such ticker.
 
 Macro/market-regime data (VIX + Treasury yield curve) is a separate, one-shot
 ingestion step -- see _ingest_macro below -- rather than a sixth per-ticker
@@ -68,6 +82,14 @@ LIVE_FETCH_WORKERS = int(os.environ.get("STOCKGRAPH_LIVE_FETCH_WORKERS", "8"))
 # drift later and later each day waiting for a field to turn exactly stale.
 FRESH_HOURS = float(os.environ.get("STOCKGRAPH_FRESH_HOURS", "20"))
 
+# XBRL company-facts only change when a company files a new 10-Q/10-K --
+# quarterly at most -- so re-checking it on the same ~daily cadence as
+# bars/earnings/fundamentals would just be repeated, mostly-wasted SEC
+# requests (each miss tries up to 4 candidate tags before giving up; see
+# secedgar._REVENUE_TAGS). A week-long window still means every ticker gets
+# checked well within any single quarter, without the daily churn.
+XBRL_FRESH_HOURS = float(os.environ.get("STOCKGRAPH_XBRL_FRESH_HOURS", str(24 * 7)))
+
 
 def _is_fresh(updated_at: str | None, max_age_hours: float = FRESH_HOURS) -> bool:
     if not updated_at:
@@ -82,19 +104,28 @@ def _is_fresh(updated_at: str | None, max_age_hours: float = FRESH_HOURS) -> boo
     return age_seconds < max_age_hours * 3600
 
 
+# Every field _fetch_live_ticker checks `need[...]` for. NOT the same set as
+# db.PROVENANCE_FIELDS -- insider_txns is deliberately absent from that
+# table (see this module's docstring) but still needs an entry here, or
+# force=True below would build a dict missing that key entirely and
+# _fetch_live_ticker's `need["insider_txns"]` lookup would raise KeyError.
+_ALL_NEEDED_FIELDS = (*db.PROVENANCE_FIELDS, "insider_txns")
+
+
 def _needed_fields(ticker: str, provenance: dict[str, dict], force: bool) -> dict[str, bool]:
-    """Which of the 5 data categories are worth fetching live for this
-    ticker right now. filings/news are cheap and time-sensitive (new
-    filings/headlines can land any day) so they're always re-fetched;
-    bars/earnings/fundamentals are the rate-limited/quota-constrained ones,
-    so those respect the freshness window."""
+    """Which data categories are worth fetching live for this ticker right
+    now. filings/news/insider_txns are cheap and time-sensitive (new
+    filings/headlines/Form 4s can land any day) so they're always
+    re-attempted; bars/earnings/fundamentals/xbrl are the rate-limited/
+    quota-constrained ones, so those respect a freshness window."""
     row = provenance.get(ticker, {})
     if force:
-        return {f: True for f in db.PROVENANCE_FIELDS}
+        return {f: True for f in _ALL_NEEDED_FIELDS}
     return {
         "bars": not _is_fresh(row.get("bars_updated_at")),
         "earnings": not _is_fresh(row.get("earnings_updated_at")),
         "fundamentals": not _is_fresh(row.get("fundamentals_updated_at")),
+        "xbrl": not _is_fresh(row.get("xbrl_updated_at"), max_age_hours=XBRL_FRESH_HOURS),
         "filings": True,
         "news": True,
         "insider_txns": True,
@@ -119,7 +150,7 @@ def _fetch_live_ticker(
     result: dict = {
         "ticker": ticker, "bars": None, "earnings": None, "filings": None,
         "news": None, "fundamentals": None, "insider_txns": None,
-        "insider_txn_accessions": [], "sources": {},
+        "insider_txn_accessions": [], "xbrl": None, "sources": {},
     }
 
     if need["bars"]:
@@ -176,6 +207,15 @@ def _fetch_live_ticker(
         except Exception as e:
             log.warning("live insider-transactions fetch failed for %s: %s", ticker, e)
 
+    if need["xbrl"]:
+        try:
+            facts = secedgar.fetch_xbrl_quarterly_facts(ticker)
+            if facts:
+                result["xbrl"] = facts
+                result["sources"]["xbrl"] = "secedgar"
+        except Exception as e:
+            log.warning("live XBRL company-facts fetch failed for %s: %s", ticker, e)
+
     if need["fundamentals"]:
         if finnhub.is_configured():
             try:
@@ -217,6 +257,9 @@ def _write_ticker_result(result: dict) -> None:
         db.upsert_insider_transactions(ticker, result["insider_txns"])
     if result.get("insider_txn_accessions"):
         db.mark_insider_accessions_seen(ticker, result["insider_txn_accessions"])
+    if result.get("xbrl"):
+        for concept, rows in result["xbrl"].items():
+            db.upsert_xbrl_series(ticker, concept, rows)
     if result["sources"]:
         db.update_provenance(ticker, result["sources"])
 
@@ -282,6 +325,8 @@ def _ingest_demo_all() -> None:
         db.upsert_news(ticker, bundle["news"])
         db.upsert_fundamentals(ticker, demo.generate_fundamentals(ticker))
         db.upsert_insider_transactions(ticker, demo.generate_insider_transactions(ticker))
+        for concept, rows in demo.generate_xbrl_quarterly_facts(ticker).items():
+            db.upsert_xbrl_series(ticker, concept, rows)
         db.update_provenance(ticker, {f: "demo" for f in db.PROVENANCE_FIELDS})
 
 
@@ -343,7 +388,8 @@ def run_ingestion(force: bool = False) -> dict:
                         result = {
                             "ticker": c.ticker, "bars": None, "earnings": None,
                             "filings": None, "news": None, "fundamentals": None,
-                            "insider_txns": None, "insider_txn_accessions": [], "sources": {},
+                            "insider_txns": None, "insider_txn_accessions": [],
+                            "xbrl": None, "sources": {},
                         }
                     upcoming = bulk_calendar.get(c.ticker)
                     if upcoming and needs[c.ticker]["earnings"]:
@@ -385,14 +431,13 @@ def run_ingestion(force: bool = False) -> dict:
                     missing_fundamentals = n["fundamentals"] and not r["fundamentals"]
                     missing_filings = n["filings"] and not r["filings"]
                     missing_news = n["news"] and not r["news"]
-                    # insider_txns is deliberately NOT part of this check: an
-                    # empty result there usually just means the company had
-                    # no open-market insider buys/sells in its last 20
-                    # filings, which is a legitimate real answer, not a fetch
-                    # failure. Treating it as a gap would trigger full
-                    # synthetic-universe regeneration on nearly every auto-
-                    # mode run (most tickers have no recent Form 4 P/S
-                    # activity) for no benefit -- it's backfilled separately
+                    # insider_txns and xbrl are deliberately NOT part of this
+                    # check: an empty result usually just means a legitimate
+                    # real answer (no recent Form 4 P/S activity; no matching
+                    # us-gaap tag for this filer), not a fetch failure.
+                    # Treating either as a gap would trigger full synthetic-
+                    # universe regeneration on a large fraction of auto-mode
+                    # runs for no benefit -- both are backfilled separately
                     # below, per-ticker, without needing the expensive full
                     # demo bundle.
                     if missing_bars or missing_earnings or missing_fundamentals or missing_filings or missing_news:
@@ -435,6 +480,17 @@ def run_ingestion(force: bool = False) -> dict:
                         db.upsert_insider_transactions(
                             ticker, demo.generate_insider_transactions(ticker)
                         )
+
+                # Same reasoning as insider transactions above: xbrl gets its
+                # own independent, lightweight backfill rather than forcing
+                # the full synthetic-universe bundle. Unlike insider_txns,
+                # this DOES update provenance -- xbrl has real live/synthetic
+                # badge semantics (see this module's docstring).
+                for ticker, result in results.items():
+                    if needs[ticker]["xbrl"] and not result.get("xbrl"):
+                        for concept, rows in demo.generate_xbrl_quarterly_facts(ticker).items():
+                            db.upsert_xbrl_series(ticker, concept, rows)
+                        db.update_provenance(ticker, {"xbrl": "demo"})
                 db.set_meta(
                     "data_mode_active",
                     f"auto (live={live_ok}, demo_fallback={live_fail})" if live_fail else "live",

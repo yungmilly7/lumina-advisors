@@ -339,6 +339,97 @@ def _macro_features(dates: pd.DatetimeIndex) -> dict[str, pd.DataFrame]:
     }
 
 
+def _xbrl_features(dates: pd.DatetimeIndex) -> dict[str, pd.DataFrame]:
+    """Quarterly revenue/net-income trend features from real historical SEC
+    XBRL filings (see app.dataclients.secedgar.fetch_xbrl_quarterly_facts) --
+    a deeper, trend-capable complement to fundamentals' single point-in-time
+    revenue_growth snapshot.
+
+    Point-in-time correct: gated on filed_date (when a quarter's figures
+    actually became public), not period_end (which quarter they describe).
+    Using period_end directly would leak a quarter's real revenue/earnings
+    into the panel weeks before any real investor could have known it --
+    the same look-ahead-bias class of bug split_boundary_dates's purge gap
+    exists to prevent elsewhere in this codebase. (A restated quarter can in
+    rare cases carry a filed_date earlier than its period_end-order position
+    would suggest relative to a later quarter -- np.maximum.accumulate keeps
+    the gate itself monotonic/well-defined for searchsorted either way.)
+
+    Vectorized per-ticker: searchsorted for the point-in-time gate (dates x
+    tickers), then a small ~12-40-entry loop over QUARTERS, not dates, for
+    the trailing-window trend -- a per-(ticker, date) Python loop here would
+    repeat the exact ~200K-iteration performance mistake Phase 1 already
+    fixed once (see _earnings_features above).
+    """
+    revenue_yoy = pd.DataFrame(0.0, index=dates, columns=TICKERS)
+    revenue_trend = pd.DataFrame(0.0, index=dates, columns=TICKERS)
+    net_income_yoy_ratio = pd.DataFrame(0.0, index=dates, columns=TICKERS)
+    dates_arr = dates.values
+
+    def _quarterly_trend(values: np.ndarray) -> np.ndarray:
+        """trend[i] = mean QoQ growth rate over the trailing up-to-8 quarters
+        ending at (and including) quarter i."""
+        n = len(values)
+        trend = np.zeros(n)
+        for i in range(n):
+            window = values[max(0, i - 7):i + 1]
+            if len(window) >= 2:
+                diffs = np.diff(window)
+                denom = np.where(window[:-1] == 0, 1.0, np.abs(window[:-1]))
+                trend[i] = float(np.mean(diffs / denom))
+        return trend
+
+    def _as_of_index(filed_sorted: np.ndarray) -> np.ndarray:
+        """For each panel date, the index of the most recent quarter known
+        as of that date (-1 if none yet)."""
+        gate = np.maximum.accumulate(filed_sorted)
+        return np.searchsorted(gate, dates_arr, side="right") - 1
+
+    for t in TICKERS:
+        rev_rows = db.get_xbrl_series(t, "revenue")
+        if rev_rows:
+            filed = np.array([pd.Timestamp(r["filed_date"]) for r in rev_rows], dtype="datetime64[ns]")
+            values = np.array([r["value"] for r in rev_rows], dtype=float)
+            idx = _as_of_index(filed)
+            has_data = idx >= 0
+            idx_c = np.clip(idx, 0, len(values) - 1)
+
+            valid4 = has_data & (idx >= 4)
+            idx4 = np.clip(idx - 4, 0, len(values) - 1)
+            prior4, now_val = values[idx4], values[idx_c]
+            yoy = np.where(
+                valid4 & (prior4 != 0), (now_val - prior4) / np.where(prior4 != 0, prior4, 1.0), 0.0
+            )
+            revenue_yoy[t] = np.where(has_data, yoy, 0.0)
+
+            trend_by_q = _quarterly_trend(values)
+            revenue_trend[t] = np.where(has_data, trend_by_q[idx_c], 0.0)
+
+        ni_rows = db.get_xbrl_series(t, "net_income")
+        if ni_rows:
+            filed = np.array([pd.Timestamp(r["filed_date"]) for r in ni_rows], dtype="datetime64[ns]")
+            values = np.array([r["value"] for r in ni_rows], dtype=float)
+            idx = _as_of_index(filed)
+            has_data = idx >= 0
+            idx_c = np.clip(idx, 0, len(values) - 1)
+
+            valid4 = has_data & (idx >= 4)
+            idx4 = np.clip(idx - 4, 0, len(values) - 1)
+            prior4, now_val = values[idx4], values[idx_c]
+            # Symmetric ratio (like insider_net_buy_ratio_90d above) rather
+            # than a raw pct change -- net income can cross zero, where a
+            # plain (now-prior)/prior blows up or flips sign meaninglessly.
+            denom = np.abs(now_val) + np.abs(prior4)
+            ratio = np.where(valid4 & (denom > 0), (now_val - prior4) / np.where(denom > 0, denom, 1.0), 0.0)
+            net_income_yoy_ratio[t] = np.where(has_data, ratio, 0.0)
+
+    return {
+        "xbrl_revenue_yoy_growth": revenue_yoy,
+        "xbrl_revenue_trend_8q": revenue_trend,
+        "xbrl_net_income_yoy_ratio": net_income_yoy_ratio,
+    }
+
+
 @dataclass
 class FeaturePanel:
     close: pd.DataFrame
@@ -437,6 +528,7 @@ def build_feature_panel() -> FeaturePanel:
     features["insider_buy_count_90d"] = insider_buy_count
 
     features.update(_macro_features(dates))
+    features.update(_xbrl_features(dates))
 
     # Sector momentum: mean mom_5 across the sector, excluding self.
     mom5 = features["mom_5"].fillna(0.0)

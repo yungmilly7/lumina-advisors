@@ -230,6 +230,18 @@ function fmtMarketCap(v) {
   if (n >= 1e6) return `$${(n / 1e6).toFixed(0)}M`;
   return `$${n.toFixed(0)}`;
 }
+function fmtFinancial(v) {
+  // Like fmtMarketCap but sign-aware (net income can be negative, unlike
+  // market cap), for the quarterly revenue/net-income trend section.
+  if (v === null || v === undefined) return "—";
+  const n = Number(v);
+  const sign = n < 0 ? "-" : "";
+  const abs = Math.abs(n);
+  if (abs >= 1e12) return `${sign}$${(abs / 1e12).toFixed(2)}T`;
+  if (abs >= 1e9) return `${sign}$${(abs / 1e9).toFixed(1)}B`;
+  if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(0)}M`;
+  return `${sign}$${abs.toFixed(0)}`;
+}
 function fmtRatio(v, digits = 1) {
   if (v === null || v === undefined) return "—";
   return Number(v).toFixed(digits);
@@ -564,8 +576,9 @@ const HEALTH_FIELD_LABELS = {
   fundamentals: "Fundamentals",
   filings: "SEC filings",
   news: "News headlines",
+  xbrl: "XBRL financials",
 };
-const HEALTH_FIELD_ORDER = ["bars", "earnings", "fundamentals", "filings", "news"];
+const HEALTH_FIELD_ORDER = ["bars", "earnings", "fundamentals", "filings", "news", "xbrl"];
 const SOURCE_LABELS = {
   yahoo: "Yahoo Finance",
   finnhub: "Finnhub",
@@ -1872,6 +1885,19 @@ function renderDetail(d) {
       })
       .join("") || `<div class="hint">No open-market insider trades in recent filings.</div>`;
 
+  const xbrlRevenue = (d.xbrl_financials && d.xbrl_financials.revenue) || [];
+  const xbrlNetIncome = (d.xbrl_financials && d.xbrl_financials.net_income) || [];
+  const netIncomeByPeriod = Object.fromEntries(xbrlNetIncome.map((r) => [r.period_end, r.value]));
+  const xbrlHTML =
+    xbrlRevenue
+      .slice(-6)
+      .reverse()
+      .map((r) => {
+        const ni = netIncomeByPeriod[r.period_end];
+        return `<div class="filing-item"><span>Q ending ${fmtDate(r.period_end)}</span><span>Rev ${fmtFinancial(r.value)}${ni != null ? ` · NI ${fmtFinancial(ni)}` : ""}</span></div>`;
+      })
+      .join("") || `<div class="hint">No SEC XBRL financial history available for this ticker yet.</div>`;
+
   panel.innerHTML = `
     <div class="detail-header">
       <h3>${d.name} <span style="color:var(--text-muted); font-weight:500;">(${d.ticker})</span></h3>
@@ -1916,6 +1942,9 @@ function renderDetail(d) {
 
     <div class="section-title">Insider transactions (open-market)</div>
     ${insiderHTML}
+
+    <div class="section-title">Financial trend${sourceBadge(d, "xbrl")}</div>
+    ${xbrlHTML}
 
     <div class="section-title">Recent headlines${sourceBadge(d, "news")}</div>
     ${newsHTML}

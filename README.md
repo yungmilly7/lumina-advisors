@@ -246,6 +246,48 @@ just always re-fetches fresh. A fetch failure for either source falls back
 to a synthetic series for exactly that source (never both, and never
 clobbering the other source's real data) rather than failing the run.
 
+## SEC XBRL financials
+
+Every forecast page also shows a "Financial trend" strip -- the last six
+reported quarters of revenue and net income, straight from each company's
+own SEC filings -- and the model gets three features built from the same
+history: `xbrl_revenue_yoy_growth` (year-over-year revenue growth),
+`xbrl_revenue_trend_8q` (an 8-quarter revenue trend direction), and
+`xbrl_net_income_yoy_ratio` (a -1..+1 dollar-weighted year-over-year change
+in net income, using the same symmetric ratio as the insider buy/sell
+balance above so a swing across zero doesn't blow up).
+
+This comes from the SEC's XBRL `companyconcept` API
+(`data.sec.gov/api/xbrl/companyconcept/...`) -- free, no API key, structured
+data straight out of each 10-Q/10-K rather than screen-scraped text. It's a
+narrower, per-concept request than the full `companyfacts` blob, asked for
+just the `Revenues`/`SalesRevenueNet` and `NetIncomeLoss` tags (trying a
+short list of common tag aliases per concept, since not every filer uses
+the same GAAP tag name), and only entries actually tagged `10-Q`/`10-K` with
+a ~one-quarter reporting duration are kept -- year-to-date and full-year
+cumulative entries are filtered out so the trend is quarter-over-quarter,
+not a mix of durations.
+
+The one thing this feature had to get right is *when* each quarter's numbers
+actually became knowable. XBRL data carries two dates -- the quarter's own
+`period_end` and the much-later `filed_date` the company actually disclosed
+it -- and a naive version of this feature would use `period_end`, which
+leaks a quarter's real results into the model weeks before any real investor
+could have seen them. Every value here is gated strictly on `filed_date`,
+so the model only ever sees a company's Q2 numbers once Q2's 10-Q was
+actually public. Unlike insider transactions and macro data, XBRL results
+carry real freshness semantics (a company's financials only change once a
+quarter), so it's tracked in the same `data_provenance`/staleness system as
+filings and fundamentals, just with its own much longer refresh window
+(7 days, vs. the general 20 hours) -- there's no reason to re-check a
+company's XBRL data every few hours between earnings.
+
+A ticker with clean, complete SEC tagging shows six quarters immediately;
+one with unusual or foreign-filer tagging (not everyone tags `us-gaap`
+consistently, and some foreign private issuers don't file 10-Q/10-K at all)
+may show fewer, or none yet -- same "legitimate empty state, not a fetch
+failure" reasoning as insider transactions above.
+
 ## Adding the AI narrative layer and chat
 
 Set `ANTHROPIC_API_KEY` in `.env` and two things turn on: the forecast

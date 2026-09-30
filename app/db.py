@@ -139,7 +139,8 @@ CREATE TABLE IF NOT EXISTS data_provenance (
     earnings_source TEXT, earnings_updated_at TEXT,
     fundamentals_source TEXT, fundamentals_updated_at TEXT,
     news_source TEXT, news_updated_at TEXT,
-    filings_source TEXT, filings_updated_at TEXT
+    filings_source TEXT, filings_updated_at TEXT,
+    xbrl_source TEXT, xbrl_updated_at TEXT
 );
 
 -- Short history of ingestion runs (bootstrap or scheduled refresh), for the
@@ -243,6 +244,26 @@ CREATE TABLE IF NOT EXISTS macro_series (
     PRIMARY KEY (series, date)
 );
 CREATE INDEX IF NOT EXISTS idx_macro_series_series_date ON macro_series(series, date);
+
+-- Historical quarterly SEC XBRL company-facts figures (revenue, net income)
+-- per ticker -- a deeper, trend-capable alternative to the single
+-- point-in-time snapshot fundamentals already provides. `filed_date` (when
+-- the filing became public) is stored separately from `period_end` (which
+-- quarter it describes) because signals.py must gate on filed_date, not
+-- period_end, to avoid look-ahead bias: a Q1 figure isn't knowable the day
+-- the quarter ends, only once the 10-Q reporting it is actually filed,
+-- typically weeks later. Tracked in data_provenance like fundamentals
+-- (real freshness semantics -- this only changes quarterly, unlike
+-- filings/insider transactions which can't be "stale" the same way).
+CREATE TABLE IF NOT EXISTS xbrl_series (
+    ticker TEXT NOT NULL,
+    concept TEXT NOT NULL,      -- revenue | net_income
+    period_end TEXT NOT NULL,
+    filed_date TEXT NOT NULL,
+    value REAL,
+    PRIMARY KEY (ticker, concept, period_end)
+);
+CREATE INDEX IF NOT EXISTS idx_xbrl_series_ticker_concept ON xbrl_series(ticker, concept, period_end);
 """
 
 
@@ -267,7 +288,31 @@ def get_conn() -> sqlite3.Connection:
 def init_db() -> None:
     conn = get_conn()
     conn.executescript(SCHEMA)
+    _migrate_added_columns(conn)
     conn.commit()
+
+
+# `CREATE TABLE IF NOT EXISTS` in SCHEMA above is a no-op for a table that
+# already exists on disk -- it does NOT add columns a later version of this
+# file introduced to an existing table. That's invisible on Render (its free
+# tier has no persistent disk, so every deploy starts from a fresh DB -- see
+# render.yaml), but a local/laptop run with an existing data/stockgraph.db
+# predating a column addition would otherwise hit "no such column" errors
+# the moment code references it. Each entry here is (table, column, DDL
+# type) for a column added after that table first shipped; safe to run on
+# every startup since ALTER TABLE ADD COLUMN is skipped once the column
+# already exists.
+_ADDED_COLUMNS = [
+    ("data_provenance", "xbrl_source", "TEXT"),
+    ("data_provenance", "xbrl_updated_at", "TEXT"),
+]
+
+
+def _migrate_added_columns(conn: sqlite3.Connection) -> None:
+    for table, column, coltype in _ADDED_COLUMNS:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
 
 @contextlib.contextmanager
@@ -410,6 +455,32 @@ def mark_insider_accessions_seen(ticker: str, accessions: list[str]) -> None:
             "INSERT OR IGNORE INTO insider_txn_filings_seen(ticker, accession_number) VALUES (?, ?)",
             [(ticker, a) for a in accessions],
         )
+
+
+def upsert_xbrl_series(ticker: str, concept: str, rows: list[dict]) -> None:
+    """`rows`: [{period_end, filed_date, value}, ...] for one concept
+    (revenue | net_income). Upsert rather than insert-or-ignore: a restated
+    figure for a period SEC has already reported (a later filing revising an
+    earlier quarter's number) should overwrite the old value, not be
+    silently dropped."""
+    if not rows:
+        return
+    with tx() as conn:
+        conn.executemany(
+            "INSERT INTO xbrl_series(ticker, concept, period_end, filed_date, value) "
+            "VALUES (:ticker, :concept, :period_end, :filed_date, :value) "
+            "ON CONFLICT(ticker, concept, period_end) DO UPDATE SET "
+            "filed_date=excluded.filed_date, value=excluded.value",
+            [{**r, "ticker": ticker, "concept": concept} for r in rows],
+        )
+
+
+def get_xbrl_series(ticker: str, concept: str) -> list[sqlite3.Row]:
+    return get_conn().execute(
+        "SELECT period_end, filed_date, value FROM xbrl_series "
+        "WHERE ticker=? AND concept=? ORDER BY period_end ASC",
+        (ticker, concept),
+    ).fetchall()
 
 
 def upsert_macro_series(rows: list[dict]) -> None:
@@ -816,7 +887,7 @@ def all_fundamentals() -> dict[str, dict]:
 
 # ---------- data provenance (live vs. synthetic, per field) ----------
 
-PROVENANCE_FIELDS = ("bars", "earnings", "fundamentals", "news", "filings")
+PROVENANCE_FIELDS = ("bars", "earnings", "fundamentals", "news", "filings", "xbrl")
 
 
 def get_all_provenance() -> dict[str, dict]:

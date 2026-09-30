@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -501,6 +502,44 @@ class TestMacroFeaturesAndPipeline(unittest.TestCase):
             latest = df.iloc[-1]
             self.assertEqual(latest.nunique(), 1, f"{name} should be identical across tickers")
 
+    def test_xbrl_feature_columns_present_and_finite(self):
+        panel = self.engine.panel
+        for name in ("xbrl_revenue_yoy_growth", "xbrl_revenue_trend_8q", "xbrl_net_income_yoy_ratio"):
+            self.assertIn(name, panel.features)
+            df = panel.features[name]
+            self.assertTrue(np.isfinite(df.to_numpy()).all(), f"{name} has non-finite values")
+
+    def test_xbrl_features_are_point_in_time_correct_no_lookahead(self):
+        # The single most important correctness property of this feature:
+        # a quarter's real figures must not become visible in the panel
+        # before their actual filed_date, or the model would be trained on
+        # information no real investor could have had -- the same class of
+        # look-ahead-bias bug split_boundary_dates's purge gap exists to
+        # prevent for the train/test split.
+        from app import db
+        from app.signals import _xbrl_features
+
+        ticker = "AAPL"  # a real universe ticker; _xbrl_features iterates TICKERS
+        with db.tx() as conn:
+            conn.execute("DELETE FROM xbrl_series WHERE ticker=? AND concept='revenue'", (ticker,))
+        rows = [
+            {"period_end": "2025-01-31", "filed_date": "2025-02-15", "value": 100.0},
+            {"period_end": "2025-04-30", "filed_date": "2025-05-15", "value": 100.0},
+            {"period_end": "2025-07-31", "filed_date": "2025-08-15", "value": 100.0},
+            {"period_end": "2025-10-31", "filed_date": "2025-11-15", "value": 100.0},
+            {"period_end": "2026-01-31", "filed_date": "2026-02-15", "value": 130.0},
+        ]
+        db.upsert_xbrl_series(ticker, "revenue", rows)
+
+        dates = pd.DatetimeIndex(["2026-02-10", "2026-02-20"])
+        yoy = _xbrl_features(dates)["xbrl_revenue_yoy_growth"][ticker]
+        # Before the 5th quarter's filed_date (2026-02-15): only 4 quarters
+        # are known -- not enough for a 4-quarters-back YoY comparison -> 0.
+        self.assertEqual(yoy.loc["2026-02-10"], 0.0)
+        # On/after 2026-02-15: the 5th quarter (130.0) is now known, compared
+        # against the 1st (100.0, exactly 4 quarters earlier) -> +30%.
+        self.assertAlmostEqual(yoy.loc["2026-02-20"], 0.30, places=6)
+
     def test_partial_live_macro_failure_does_not_clobber_the_series_that_succeeded(self):
         # Regression test: the fallback path used to re-upsert ALL four
         # synthetic series whenever EITHER VIX or Treasury failed, which
@@ -521,6 +560,138 @@ class TestMacroFeaturesAndPipeline(unittest.TestCase):
 
         stored = {r["date"]: r["value"] for r in db.get_macro_series("vix_close")}
         self.assertEqual(stored.get("2026-01-02"), 12.34)  # untouched by the Treasury-side fallback
+
+
+def _xbrl_usd_fact(start, end, val, filed, form="10-Q"):
+    return {"start": start, "end": end, "val": val, "filed": filed, "form": form}
+
+
+class TestXbrlParsing(unittest.TestCase):
+    """The quarter-extraction logic is where messy real-world XBRL data
+    (duplicate/amended entries, mixed quarterly/annual/cumulative durations)
+    gets collapsed into one clean value per quarter, so it's tested directly
+    against hand-built fact entries rather than only indirectly."""
+
+    def test_keeps_only_single_quarter_durations(self):
+        from app.dataclients.secedgar import _extract_quarterly_series
+
+        entries = [
+            _xbrl_usd_fact("2025-01-01", "2025-03-31", 100.0, "2025-05-01"),  # ~89d, quarterly: keep
+            _xbrl_usd_fact("2025-01-01", "2025-06-30", 250.0, "2025-08-01"),  # ~180d, H1 cumulative: drop
+            _xbrl_usd_fact("2024-01-01", "2024-12-31", 900.0, "2025-02-01"),  # ~365d, annual: drop
+        ]
+        series = _extract_quarterly_series(entries)
+        self.assertEqual(len(series), 1)
+        self.assertEqual(series[0]["period_end"], "2025-03-31")
+        self.assertEqual(series[0]["value"], 100.0)
+
+    def test_restatement_keeps_the_most_recently_filed_value(self):
+        from app.dataclients.secedgar import _extract_quarterly_series
+
+        entries = [
+            _xbrl_usd_fact("2025-01-01", "2025-03-31", 100.0, "2025-05-01", form="10-Q"),
+            _xbrl_usd_fact("2025-01-01", "2025-03-31", 105.0, "2026-02-01", form="10-K"),  # restated later
+        ]
+        series = _extract_quarterly_series(entries)
+        self.assertEqual(len(series), 1)
+        self.assertEqual(series[0]["value"], 105.0)  # the later-filed value wins
+
+    def test_ignores_non_10q_10k_forms_and_incomplete_entries(self):
+        from app.dataclients.secedgar import _extract_quarterly_series
+
+        entries = [
+            _xbrl_usd_fact("2025-01-01", "2025-03-31", 100.0, "2025-05-01", form="8-K"),
+            {"start": "2025-01-01", "end": "2025-03-31", "val": None, "filed": "2025-05-01", "form": "10-Q"},
+            {"start": None, "end": "2025-03-31", "val": 100.0, "filed": "2025-05-01", "form": "10-Q"},
+        ]
+        self.assertEqual(_extract_quarterly_series(entries), [])
+
+    def test_fetch_xbrl_quarterly_facts_tries_tags_in_order_until_one_hits(self):
+        from unittest.mock import patch
+        import app.dataclients.secedgar as secedgar
+
+        secedgar._cik_map_cache = {"TEST": "1234567890"}
+        good_entries = [_xbrl_usd_fact("2025-01-01", "2025-03-31", 500.0, "2025-05-01")]
+
+        def fake_get_json(url, headers=None):
+            if "RevenueFromContractWithCustomerExcludingAssessedTax" in url:
+                raise Exception("404 not found")  # this company doesn't use this tag
+            if "Revenues" in url:
+                return {"units": {"USD": good_entries}}
+            if "NetIncomeLoss" in url:
+                return {"units": {"USD": good_entries}}
+            raise Exception("unexpected tag tried")
+
+        with patch("app.dataclients.secedgar.get_json", side_effect=fake_get_json):
+            facts = secedgar.fetch_xbrl_quarterly_facts("TEST")
+
+        self.assertIn("revenue", facts)
+        self.assertIn("net_income", facts)
+        self.assertEqual(facts["revenue"][0]["value"], 500.0)
+
+    def test_fetch_xbrl_quarterly_facts_missing_concept_is_a_clean_empty_result(self):
+        from unittest.mock import patch
+        import app.dataclients.secedgar as secedgar
+
+        secedgar._cik_map_cache = {"TEST": "1234567890"}
+        with patch("app.dataclients.secedgar.get_json", side_effect=Exception("404 not found")):
+            facts = secedgar.fetch_xbrl_quarterly_facts("TEST")
+        self.assertEqual(facts, {})
+
+
+class TestXbrlDbDemoAndPipeline(unittest.TestCase):
+    def test_demo_generator_is_deterministic_and_covers_both_concepts(self):
+        from app.dataclients import demo
+
+        facts_a = demo.generate_xbrl_quarterly_facts("AAPL")
+        facts_b = demo.generate_xbrl_quarterly_facts("AAPL")
+        self.assertEqual(facts_a, facts_b)
+        self.assertEqual(set(facts_a.keys()), {"revenue", "net_income"})
+        self.assertEqual(len(facts_a["revenue"]), 12)  # 12 trailing quarters
+
+    def test_demo_generator_filed_date_lags_period_end(self):
+        from app.dataclients import demo
+
+        for row in demo.generate_xbrl_quarterly_facts("MSFT")["revenue"]:
+            self.assertGreater(row["filed_date"], row["period_end"])
+
+    def test_db_roundtrip_and_restatement_overwrite(self):
+        from app import db
+
+        db.upsert_xbrl_series("ZZZZ_XBRL_TEST", "revenue", [
+            {"period_end": "2025-03-31", "filed_date": "2025-05-01", "value": 100.0},
+        ])
+        # A later run restates the same period -- should overwrite, not duplicate.
+        db.upsert_xbrl_series("ZZZZ_XBRL_TEST", "revenue", [
+            {"period_end": "2025-03-31", "filed_date": "2025-08-01", "value": 110.0},
+        ])
+        stored = db.get_xbrl_series("ZZZZ_XBRL_TEST", "revenue")
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["value"], 110.0)
+        self.assertEqual(stored[0]["filed_date"], "2025-08-01")
+
+    def test_needed_fields_respects_its_own_longer_freshness_window(self):
+        from app import db
+        from app.pipeline import _needed_fields, XBRL_FRESH_HOURS
+
+        self.assertGreater(XBRL_FRESH_HOURS, 24)  # meaningfully longer than the general FRESH_HOURS
+        db.update_provenance("AAPL", {"xbrl": "secedgar"})
+        provenance = db.get_all_provenance()
+        needs = _needed_fields("AAPL", provenance, force=False)
+        self.assertFalse(needs["xbrl"])  # just updated, shouldn't need re-fetching
+
+    def test_force_true_includes_insider_txns_key(self):
+        # Regression test: _needed_fields(force=True) used to build its dict
+        # from db.PROVENANCE_FIELDS alone, which doesn't include
+        # insider_txns -- _fetch_live_ticker's need["insider_txns"] lookup
+        # would then raise KeyError on any forced refresh.
+        from app import db
+        from app.pipeline import _needed_fields
+
+        needs = _needed_fields("AAPL", db.get_all_provenance(), force=True)
+        self.assertIn("insider_txns", needs)
+        self.assertIn("xbrl", needs)
+        self.assertTrue(all(needs.values()))
 
 
 class TestYahooCrumbHandshake(unittest.TestCase):

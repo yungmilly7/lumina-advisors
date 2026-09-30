@@ -81,6 +81,9 @@ FACTOR_LABELS = {
     "vix_change_5d": "VIX 5-day change (volatility regime shift)",
     "yield_curve_10y_2y": "Treasury yield curve (10y-2y spread)",
     "yield_curve_10y_3m": "Treasury yield curve (10y-3mo spread)",
+    "xbrl_revenue_yoy_growth": "revenue growth vs. year-ago quarter (SEC filings)",
+    "xbrl_revenue_trend_8q": "revenue growth trajectory (trailing 8 quarters, SEC filings)",
+    "xbrl_net_income_yoy_ratio": "net income trend vs. year-ago quarter (SEC filings)",
 }
 
 

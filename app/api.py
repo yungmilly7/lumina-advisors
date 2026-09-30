@@ -189,6 +189,13 @@ def forecast_detail(request):
     insider_rows = db.get_insider_transactions(ticker, limit=15)
     row["insider_transactions"] = [dict(i) for i in insider_rows]
 
+    # Last 8 known quarters of real, filed SEC figures -- a trend view to go
+    # with the single-snapshot numbers already in `fundamentals` above.
+    row["xbrl_financials"] = {
+        "revenue": [dict(r) for r in db.get_xbrl_series(ticker, "revenue")][-8:],
+        "net_income": [dict(r) for r in db.get_xbrl_series(ticker, "net_income")][-8:],
+    }
+
     news_rows = db.get_news(ticker, limit=12)
     row["news"] = [
         {**dict(n), "event_tags": json.loads(n["event_tags"] or "[]")} for n in news_rows

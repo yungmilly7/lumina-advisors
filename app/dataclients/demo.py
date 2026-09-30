@@ -420,3 +420,63 @@ def generate_macro_series(as_of: date | None = None) -> list[dict]:
         rows.append({"series": "yield_2y", "date": iso, "value": round(float(yield_2y[i]), 3)})
         rows.append({"series": "yield_10y", "date": iso, "value": round(float(yield_10y[i]), 3)})
     return rows
+
+
+def _quarter_end_on_or_before(d: date) -> date:
+    """Last calendar-quarter-end (Mar 31 / Jun 30 / Sep 30 / Dec 31) on or
+    before `d`. Pure stdlib date arithmetic -- no dateutil dependency."""
+    candidates = []
+    for y in (d.year, d.year - 1):
+        for m in (3, 6, 9, 12):
+            qe = date(y, 12, 31) if m == 12 else date(y, m + 1, 1) - timedelta(days=1)
+            if qe <= d:
+                candidates.append(qe)
+    return max(candidates)
+
+
+def _step_back_one_quarter(qe: date) -> date:
+    prev_month, prev_year = qe.month - 3, qe.year
+    if prev_month <= 0:
+        prev_month += 12
+        prev_year -= 1
+    return date(prev_year, 12, 31) if prev_month == 12 else date(prev_year, prev_month + 1, 1) - timedelta(days=1)
+
+
+def generate_xbrl_quarterly_facts(ticker: str, as_of: date | None = None) -> dict[str, list[dict]]:
+    """Synthetic quarterly revenue + net income history for demo mode,
+    deterministic per ticker -- a richer, trend-capable stand-in for the
+    single point-in-time snapshot generate_fundamentals already provides.
+
+    `filed_date` is offset ~45 days after `period_end` (a realistic
+    10-Q/10-K reporting lag) because signals.py gates visibility on
+    filed_date, not period_end, to avoid look-ahead bias -- the synthetic
+    data needs that same lag or it wouldn't exercise that gating honestly.
+    """
+    as_of = as_of or datetime.now(timezone.utc).date()
+    rng = np.random.default_rng(_seed_for(ticker) ^ 0x5842524C)  # arbitrary "XBRL" salt
+
+    n_quarters = 12
+    latest_completed = _quarter_end_on_or_before(as_of - timedelta(days=90))
+    quarter_ends = [latest_completed]
+    for _ in range(n_quarters - 1):
+        quarter_ends.append(_step_back_one_quarter(quarter_ends[-1]))
+    quarter_ends.reverse()  # ascending, oldest first
+
+    base_revenue = float(rng.uniform(5e7, 8e10))
+    growth_mean = float(rng.normal(0.02, 0.04))  # ~2% mean quarterly growth, some tickers decline
+    revenues = [base_revenue]
+    for _ in range(n_quarters - 1):
+        shock = float(rng.normal(growth_mean, 0.06))
+        revenues.append(revenues[-1] * max(0.4, 1.0 + shock))  # floored, revenue can't go to ~0 in one quarter
+
+    margin_mean = float(rng.uniform(-0.05, 0.25))
+    net_incomes = [rev * (margin_mean + float(rng.normal(0, 0.05))) for rev in revenues]
+
+    def _rows(values: list[float]) -> list[dict]:
+        out = []
+        for qe, val in zip(quarter_ends, values):
+            filed = qe + timedelta(days=45)
+            out.append({"period_end": qe.isoformat(), "filed_date": filed.isoformat(), "value": round(val, 2)})
+        return out
+
+    return {"revenue": _rows(revenues), "net_income": _rows(net_incomes)}

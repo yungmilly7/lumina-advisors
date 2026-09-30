@@ -1,5 +1,6 @@
-"""SEC EDGAR client: recent filings per ticker (10-K, 10-Q, 8-K), plus
-insider transactions (Form 4).
+"""SEC EDGAR client: recent filings per ticker (10-K, 10-Q, 8-K), insider
+transactions (Form 4), and quarterly XBRL company-facts history (revenue,
+net income).
 
 SEC requires a descriptive User-Agent with contact info on every request,
 and rate-limits aggressively, so we keep requests minimal and cache the
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from datetime import date
 import xml.etree.ElementTree as ET
 
 from app.config import SEC_USER_AGENT
@@ -18,6 +20,7 @@ log = logging.getLogger("stockgraph.secedgar")
 
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:0>10}.json"
+COMPANY_CONCEPT_URL = "https://data.sec.gov/api/xbrl/companyconcept/CIK{cik:0>10}/us-gaap/{tag}.json"
 
 _headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
 
@@ -233,3 +236,88 @@ def fetch_recent_filings(ticker: str, limit: int = 10) -> list[dict]:
         if len(rows) >= limit:
             break
     return rows
+
+
+# XBRL tag naming for a given financial concept isn't fully standardized
+# across filers/taxonomy versions (older filers, or ones that haven't
+# adopted the newer revenue-recognition tag, use a different tag for the
+# same concept) -- tried in order, first one that returns real data wins.
+_REVENUE_TAGS = (
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "RevenueFromContractWithCustomerIncludingAssessedTax",
+    "Revenues",
+    "SalesRevenueNet",
+)
+_NET_INCOME_TAGS = ("NetIncomeLoss",)
+
+_XBRL_CONCEPTS = {"revenue": _REVENUE_TAGS, "net_income": _NET_INCOME_TAGS}
+
+
+def _fetch_concept_usd_facts(cik: str, tag: str) -> list[dict] | None:
+    """One (cik, tag) pair -> its raw USD-unit fact entries, or None if this
+    company doesn't report under that tag at all (SEC 404s a concept a
+    company has no data for -- that's an expected miss while trying
+    candidate tags, not a real error, so it's swallowed here rather than
+    logged company-by-company at scale)."""
+    try:
+        data = get_json(COMPANY_CONCEPT_URL.format(cik=cik, tag=tag), headers=_headers)
+    except Exception:
+        return None
+    usd = data.get("units", {}).get("USD", [])
+    return usd or None
+
+
+def _extract_quarterly_series(usd_entries: list[dict]) -> list[dict]:
+    """Collapses raw XBRL fact entries (which include duplicates across
+    amended filings, and mixes quarterly/YTD-cumulative/annual durations
+    all under the same tag) down to one clean value per fiscal quarter.
+
+    Keeps only entries covering a single ~quarter (75-100 day duration) from
+    a 10-Q/10-K -- this drops annual totals, half-year/nine-month cumulative
+    figures, and other non-comparable durations that would otherwise corrupt
+    a quarter-over-quarter trend. When a quarter has been restated (reported
+    more than once, e.g. a later 10-K restating a prior 10-Q's figure), the
+    most-recently-filed value wins.
+    """
+    best_by_end: dict[str, dict] = {}
+    for e in usd_entries:
+        if e.get("form") not in ("10-Q", "10-K"):
+            continue
+        start, end, val, filed = e.get("start"), e.get("end"), e.get("val"), e.get("filed")
+        if not start or not end or val is None or not filed:
+            continue
+        try:
+            duration_days = (date.fromisoformat(end) - date.fromisoformat(start)).days
+        except ValueError:
+            continue
+        if not (75 <= duration_days <= 100):
+            continue
+        prior = best_by_end.get(end)
+        if prior is None or filed > prior["filed_date"]:
+            best_by_end[end] = {"period_end": end, "filed_date": filed, "value": float(val)}
+    return sorted(best_by_end.values(), key=lambda r: r["period_end"])
+
+
+def fetch_xbrl_quarterly_facts(ticker: str) -> dict[str, list[dict]]:
+    """Returns {"revenue": [{period_end, filed_date, value}, ...],
+    "net_income": [...]}, each ascending by period_end. A concept missing
+    from the result means this company doesn't report under any of the
+    candidate tags tried (e.g. a foreign private issuer filing under IFRS
+    rather than us-gaap) -- a real, legitimate empty state, not a fetch
+    failure, same as a company with no recent open-market insider trades.
+    """
+    cik_map = _load_cik_map()
+    cik = cik_map.get(ticker.upper())
+    if not cik:
+        return {}
+    result: dict[str, list[dict]] = {}
+    for concept, tags in _XBRL_CONCEPTS.items():
+        for tag in tags:
+            usd_entries = _fetch_concept_usd_facts(cik, tag)
+            if not usd_entries:
+                continue
+            series = _extract_quarterly_series(usd_entries)
+            if series:
+                result[concept] = series
+                break
+    return result
