@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 
 from app import db
-from app.config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
+from app.config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, DATA_MODE
 from app.ml import LogisticRegression, Pipeline, RidgeRegression, StandardScaler
 from app.signals import FeaturePanel, build_feature_panel, split_boundary_dates
 from app.universe import COMPANY_BY_TICKER, adjacency
@@ -37,6 +37,16 @@ from app.universe import COMPANY_BY_TICKER, adjacency
 log = logging.getLogger("stockgraph.forecast")
 
 HORIZONS = [1, 5, 20]
+
+# Demo mode's data is synthetic and rebuilt from scratch on every cold boot
+# (the public host has no persistent disk -- see DEPLOY.md), so there's no
+# real backtest track record riding on training to full convergence the
+# way there is for auto/live mode. Fewer gradient-descent steps reaches
+# essentially the same decision boundary on this data in a fraction of the
+# time, all 448 companies and all 3 horizons still included. auto/live
+# mode (Danny's own laptop) is untouched -- this only shortens the
+# iteration count, nothing else about what gets trained.
+LOGISTIC_ITERATIONS = 150 if DATA_MODE == "demo" else 500
 
 FACTOR_LABELS = {
     "mom_5": "5-day price momentum",
@@ -113,7 +123,7 @@ def train_models(panel: FeaturePanel, horizons: list[int] = HORIZONS) -> Forecas
         yret_train, yret_test = y_ret[train_mask], y_ret[test_mask]
 
         dir_pipe = Pipeline(
-            [("scaler", StandardScaler()), ("clf", LogisticRegression(alpha=2.0, lr=0.5, iterations=500))]
+            [("scaler", StandardScaler()), ("clf", LogisticRegression(alpha=2.0, lr=0.5, iterations=LOGISTIC_ITERATIONS))]
         )
         dir_pipe.fit(X_train, ydir_train)
 

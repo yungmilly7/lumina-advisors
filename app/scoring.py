@@ -42,28 +42,36 @@ def run_backtest(panel: FeaturePanel, models: ForecastModels) -> dict:
         actual_move = test_df[f"fwd_ret_{h}"].to_numpy(dtype=float)
         actual_dir = test_df[f"fwd_dir_{h}"].to_numpy(dtype=float)
 
-        rows = []
-        for i, (_, r) in enumerate(test_df.iterrows()):
-            predicted_direction = "up" if pred_prob[i] >= 0.5 else "down"
-            direction_correct = int((pred_prob[i] >= 0.5) == bool(actual_dir[i]))
-            rows.append(
-                {
-                    "ticker": r["ticker"],
-                    "as_of": str(r["date"].date()) if hasattr(r["date"], "date") else str(r["date"]),
-                    "horizon_days": int(h),
-                    "predicted_direction": predicted_direction,
-                    "predicted_move_pct": float(pred_move[i]),
-                    "actual_move_pct": float(actual_move[i]),
-                    "direction_correct": direction_correct,
-                    "abs_error_pct": float(abs(pred_move[i] - actual_move[i])),
-                    "evaluated_at": evaluated_at,
-                }
-            )
-        for row in rows:
-            db.insert_outcome(row)
+        # Vectorized rather than a per-row iterrows() loop: with tens of
+        # thousands of held-out rows per horizon, building each row's dict
+        # via pandas' row-by-row iteration was itself a meaningful chunk of
+        # bootstrap time, on top of the per-row insert cost that
+        # insert_outcomes_batch below now avoids.
+        pred_dir_up = pred_prob >= 0.5
+        predicted_direction = np.where(pred_dir_up, "up", "down")
+        direction_correct = (pred_dir_up == actual_dir.astype(bool)).astype(int)
+        abs_error = np.abs(pred_move - actual_move)
+        tickers = test_df["ticker"].to_numpy()
+        as_of_dates = test_df["date"].dt.strftime("%Y-%m-%d").to_numpy()
 
-        hit_rate = float(np.mean([r["direction_correct"] for r in rows]))
-        mae = float(np.mean([r["abs_error_pct"] for r in rows]))
+        rows = [
+            {
+                "ticker": tickers[i],
+                "as_of": as_of_dates[i],
+                "horizon_days": int(h),
+                "predicted_direction": predicted_direction[i],
+                "predicted_move_pct": float(pred_move[i]),
+                "actual_move_pct": float(actual_move[i]),
+                "direction_correct": int(direction_correct[i]),
+                "abs_error_pct": float(abs_error[i]),
+                "evaluated_at": evaluated_at,
+            }
+            for i in range(len(test_df))
+        ]
+        db.insert_outcomes_batch(rows)
+
+        hit_rate = float(direction_correct.mean())
+        mae = float(abs_error.mean())
         summary[h] = {"n": len(rows), "hit_rate": hit_rate, "mae": mae}
         log.info("backtest horizon=%sd n=%d hit_rate=%.3f mae=%.4f", h, len(rows), hit_rate, mae)
 

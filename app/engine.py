@@ -99,9 +99,14 @@ class Engine:
         for h in self.models.by_horizon:
             forecasts = generate_all_forecasts(self.panel, self.models, h, use_llm=False)
             self.forecast_cache[h] = forecasts
+            rows = []
             for f in forecasts:
                 self.forecast_by_ticker[(f["ticker"], h)] = f
-                db.insert_forecast({k: v for k, v in f.items() if not k.startswith("_")})
+                rows.append({k: v for k, v in f.items() if not k.startswith("_")})
+            # Batched into one commit per horizon instead of one commit per
+            # company -- 448 individual disk fsyncs was a meaningful chunk
+            # of a full bootstrap. See db.insert_forecasts_batch.
+            db.insert_forecasts_batch(rows)
 
     def list_forecasts(self, horizon: int) -> list[dict]:
         with self.lock:

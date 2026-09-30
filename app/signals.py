@@ -194,32 +194,45 @@ def _news_sentiment_panel(dates: pd.DatetimeIndex) -> tuple[pd.DataFrame, pd.Dat
 
 
 def _earnings_features(dates: pd.DatetimeIndex) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    days_to_next = pd.DataFrame(np.nan, index=dates, columns=TICKERS)
-    days_since_last = pd.DataFrame(np.nan, index=dates, columns=TICKERS)
+    """Vectorized with searchsorted, mirroring _filing_recency_features
+    above -- this used to be a per-(ticker, date) Python loop with scalar
+    pandas .loc writes (roughly 450 dates x 448 tickers = ~200K individual
+    assignments), which turned out to be the single slowest step in
+    build_feature_panel once measured on a slow/CPU-throttled host."""
+    days_to_next = pd.DataFrame(999.0, index=dates, columns=TICKERS)
+    days_since_last = pd.DataFrame(999.0, index=dates, columns=TICKERS)
     last_surprise = pd.DataFrame(0.0, index=dates, columns=TICKERS)
+    dates_arr = dates.values  # datetime64[ns], ascending
 
     for t in TICKERS:
         rows = db.get_earnings(t)
         if not rows:
             continue
-        report_dates = pd.to_datetime([r["report_date"] for r in rows if r["report_date"]])
-        surprises = {
+        surprise_by_date = {
             pd.Timestamp(r["report_date"]): (r["surprise_pct"] or 0.0)
             for r in rows
             if r["report_date"] and not r["is_future"]
         }
-        if len(report_dates) == 0:
+        report_list = sorted({pd.Timestamp(r["report_date"]) for r in rows if r["report_date"]})
+        if not report_list:
             continue
-        rd_sorted = sorted(report_dates)
-        for d in dates:
-            future = [rd for rd in rd_sorted if rd >= d]
-            past = [rd for rd in rd_sorted if rd < d]
-            if future:
-                days_to_next.loc[d, t] = (future[0] - d).days
-            if past:
-                last = past[-1]
-                days_since_last.loc[d, t] = (d - last).days
-                last_surprise.loc[d, t] = surprises.get(last, 0.0)
+        rd_sorted = np.array(report_list, dtype="datetime64[ns]")
+        surprise_sorted = np.array([surprise_by_date.get(d, 0.0) for d in report_list], dtype=float)
+
+        # First report on/after each date ("days to next").
+        next_idx = np.searchsorted(rd_sorted, dates_arr, side="left")
+        has_future = next_idx < len(rd_sorted)
+        next_clipped = np.clip(next_idx, 0, len(rd_sorted) - 1)
+        to_next_days = (rd_sorted[next_clipped] - dates_arr) / np.timedelta64(1, "D")
+        days_to_next[t] = np.where(has_future, to_next_days, 999.0)
+
+        # Last report strictly before each date ("days since last" + its surprise).
+        past_idx = next_idx - 1
+        has_past = past_idx >= 0
+        past_clipped = np.clip(past_idx, 0, None)
+        since_last_days = (dates_arr - rd_sorted[past_clipped]) / np.timedelta64(1, "D")
+        days_since_last[t] = np.where(has_past, since_last_days, 999.0)
+        last_surprise[t] = np.where(has_past, surprise_sorted[past_clipped], 0.0)
 
     return days_to_next.fillna(999), days_since_last.fillna(999), last_surprise
 

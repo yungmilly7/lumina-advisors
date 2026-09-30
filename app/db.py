@@ -341,6 +341,35 @@ def insert_forecast(row: dict) -> None:
         )
 
 
+def insert_forecasts_batch(rows: list[dict]) -> None:
+    """Same upsert as insert_forecast, batched into a single transaction.
+
+    A full bootstrap regenerates every (ticker, horizon) forecast at once
+    (448 companies x however many horizons) -- doing that as one INSERT-
+    plus-commit per row meant paying a separate disk fsync per row for
+    what is, in total, a couple of megabytes of data. One commit for the
+    whole batch is the same data, written far faster."""
+    if not rows:
+        return
+    with tx() as conn:
+        conn.executemany(
+            "INSERT INTO forecasts(ticker, as_of, horizon_days, direction, prob_up, "
+            "expected_move_pct, low_pct, high_pct, confidence, rationale, drivers, "
+            "llm_narrative, base_price, target_price) VALUES "
+            "(:ticker, :as_of, :horizon_days, :direction, :prob_up, :expected_move_pct, "
+            ":low_pct, :high_pct, :confidence, :rationale, :drivers, :llm_narrative, "
+            ":base_price, :target_price) "
+            "ON CONFLICT(ticker, as_of, horizon_days) DO UPDATE SET "
+            "direction=excluded.direction, prob_up=excluded.prob_up, "
+            "expected_move_pct=excluded.expected_move_pct, low_pct=excluded.low_pct, "
+            "high_pct=excluded.high_pct, confidence=excluded.confidence, "
+            "rationale=excluded.rationale, drivers=excluded.drivers, "
+            "llm_narrative=excluded.llm_narrative, base_price=excluded.base_price, "
+            "target_price=excluded.target_price",
+            rows,
+        )
+
+
 def latest_forecast(ticker: str) -> sqlite3.Row | None:
     return get_conn().execute(
         "SELECT * FROM forecasts WHERE ticker=? ORDER BY as_of DESC LIMIT 1", (ticker,)
@@ -372,6 +401,33 @@ def insert_outcome(row: dict) -> None:
             "direction_correct=excluded.direction_correct, "
             "abs_error_pct=excluded.abs_error_pct, evaluated_at=excluded.evaluated_at",
             row,
+        )
+
+
+def insert_outcomes_batch(rows: list[dict]) -> None:
+    """Same upsert as insert_outcome, batched into a single transaction.
+
+    run_backtest scores every held-out (ticker, date) row per horizon --
+    tens of thousands of rows across the held-out slice x 3 horizons. One
+    INSERT-plus-commit per row was, empirically, the dominant cost of a
+    full bootstrap (each commit is a separate disk fsync; on a slow or
+    throttled disk that's minutes of pure I/O wait). Batching the whole
+    horizon's rows into one transaction writes the identical data with a
+    single commit instead."""
+    if not rows:
+        return
+    with tx() as conn:
+        conn.executemany(
+            "INSERT INTO forecast_outcomes(ticker, as_of, horizon_days, "
+            "predicted_direction, predicted_move_pct, actual_move_pct, "
+            "direction_correct, abs_error_pct, evaluated_at) VALUES "
+            "(:ticker, :as_of, :horizon_days, :predicted_direction, :predicted_move_pct, "
+            ":actual_move_pct, :direction_correct, :abs_error_pct, :evaluated_at) "
+            "ON CONFLICT(ticker, as_of, horizon_days) DO UPDATE SET "
+            "actual_move_pct=excluded.actual_move_pct, "
+            "direction_correct=excluded.direction_correct, "
+            "abs_error_pct=excluded.abs_error_pct, evaluated_at=excluded.evaluated_at",
+            rows,
         )
 
 
