@@ -302,6 +302,43 @@ def _insider_features(dates: pd.DatetimeIndex) -> tuple[pd.DataFrame, pd.DataFra
     return net_buy_ratio, buy_count
 
 
+def _macro_features(dates: pd.DatetimeIndex) -> dict[str, pd.DataFrame]:
+    """Market-wide regime context (VIX level/momentum, Treasury yield-curve
+    spreads) broadcast identically to every ticker's column -- the same
+    pattern build_feature_panel already uses for market_mom_5. This isn't a
+    per-company signal; it's shared macro backdrop every company's forecast
+    should see the same way.
+
+    The two spreads (10y-2y, 10y-3m) are the classic yield-curve-inversion
+    recession indicators; VIX level/5-day-change is the standard equity
+    fear-gauge regime signal. Missing days (the macro source's calendar
+    doesn't line up exactly with the equity trading calendar this panel
+    uses, or a fresh DB with no ingestion run yet) are forward-filled -- a
+    slow-moving macro signal shouldn't zero out over a one-day gap -- with
+    any remaining leading gap back-filled from the first available value.
+    """
+    def _series_for(name: str) -> pd.Series:
+        rows = db.get_macro_series(name)
+        if not rows:
+            return pd.Series(index=dates, dtype=float)
+        idx = pd.to_datetime([r["date"] for r in rows])
+        s = pd.Series([r["value"] for r in rows], index=idx).sort_index()
+        return s.reindex(dates).ffill().bfill()
+
+    vix = _series_for("vix_close")
+    yield_3m = _series_for("yield_3m")
+    yield_2y = _series_for("yield_2y")
+    yield_10y = _series_for("yield_10y")
+    vix_change_5d = vix.pct_change(5)
+
+    return {
+        "vix_level": pd.DataFrame({t: vix for t in TICKERS}),
+        "vix_change_5d": pd.DataFrame({t: vix_change_5d for t in TICKERS}),
+        "yield_curve_10y_2y": pd.DataFrame({t: (yield_10y - yield_2y) for t in TICKERS}),
+        "yield_curve_10y_3m": pd.DataFrame({t: (yield_10y - yield_3m) for t in TICKERS}),
+    }
+
+
 @dataclass
 class FeaturePanel:
     close: pd.DataFrame
@@ -398,6 +435,8 @@ def build_feature_panel() -> FeaturePanel:
     insider_net_buy_ratio, insider_buy_count = _insider_features(dates)
     features["insider_net_buy_ratio_90d"] = insider_net_buy_ratio
     features["insider_buy_count_90d"] = insider_buy_count
+
+    features.update(_macro_features(dates))
 
     # Sector momentum: mean mom_5 across the sector, excluding self.
     mom5 = features["mom_5"].fillna(0.0)

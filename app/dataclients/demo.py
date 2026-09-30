@@ -373,3 +373,50 @@ def generate_insider_transactions(ticker: str, as_of: date | None = None) -> lis
         )
     rows.sort(key=lambda r: r["transaction_date"], reverse=True)
     return rows
+
+
+def generate_macro_series(as_of: date | None = None) -> list[dict]:
+    """Synthetic VIX + Treasury yield curve history for demo mode, in the
+    same {series, date, value} shape app.db.upsert_macro_series expects.
+
+    Each series is a mean-reverting (Ornstein-Uhlenbeck-style) random walk
+    around a plausible real-world level -- not calibrated to any specific
+    historical period, just structurally similar (VIX clusters low with
+    occasional spikes; yields drift slowly) so it exercises the same
+    feature-engineering code path as live data honestly."""
+    as_of = as_of or datetime.now(timezone.utc).date()
+    dates = _trading_dates(PRICE_HISTORY_DAYS, as_of)
+    n = len(dates)
+    rng = np.random.default_rng(UNIVERSE_SEED ^ 0x4D4143524F)  # "MACRO" bytes, arbitrary
+
+    def mean_reverting(level: float, vol: float, reversion: float, floor: float) -> np.ndarray:
+        vals = np.empty(n)
+        vals[0] = level
+        shocks = rng.normal(0, vol, n)
+        for i in range(1, n):
+            vals[i] = vals[i - 1] + reversion * (level - vals[i - 1]) + shocks[i]
+            vals[i] = max(vals[i], floor)
+        return vals
+
+    vix = mean_reverting(level=17.0, vol=1.3, reversion=0.08, floor=9.0)
+    # A handful of synthetic "vol spike" events, same spirit as the
+    # idiosyncratic news-event jumps in generate_universe_demo_data.
+    n_spikes = int(rng.integers(2, 5))
+    for _ in range(n_spikes):
+        start = int(rng.integers(10, max(11, n - 15)))
+        spike_mag = float(rng.uniform(8, 25))
+        decay = np.exp(-np.arange(min(15, n - start)) / 4.0)
+        vix[start:start + len(decay)] += spike_mag * decay
+
+    yield_3m = mean_reverting(level=5.0, vol=0.03, reversion=0.03, floor=0.0)
+    yield_2y = mean_reverting(level=4.2, vol=0.04, reversion=0.03, floor=0.0)
+    yield_10y = mean_reverting(level=4.3, vol=0.03, reversion=0.02, floor=0.0)
+
+    rows: list[dict] = []
+    for i, d in enumerate(dates):
+        iso = d.isoformat()
+        rows.append({"series": "vix_close", "date": iso, "value": round(float(vix[i]), 2)})
+        rows.append({"series": "yield_3m", "date": iso, "value": round(float(yield_3m[i]), 3)})
+        rows.append({"series": "yield_2y", "date": iso, "value": round(float(yield_2y[i]), 3)})
+        rows.append({"series": "yield_10y", "date": iso, "value": round(float(yield_10y[i]), 3)})
+    return rows

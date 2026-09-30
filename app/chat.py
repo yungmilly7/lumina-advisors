@@ -96,6 +96,20 @@ RECENT NEWS (up to 6, most recent first):
 {chr(10).join(news_lines) or "  (none)"}"""
 
 
+def _macro_regime_line() -> str:
+    """One line of shared macro context (VIX, yield curve) for the
+    whole-market chat snapshot -- best-effort, since a fresh DB before the
+    first ingestion run has no macro_series rows yet."""
+    vals = db.latest_macro_values()
+    if not vals.get("vix_close"):
+        return ""
+    bits = [f"VIX {vals['vix_close']:.1f}"]
+    if vals.get("yield_10y") is not None and vals.get("yield_2y") is not None:
+        spread = vals["yield_10y"] - vals["yield_2y"]
+        bits.append(f"10y-2y Treasury spread {spread:+.2f}pp{' (inverted)' if spread < 0 else ''}")
+    return "  macro regime: " + ", ".join(bits)
+
+
 def _market_snapshot(horizon: int) -> str:
     forecasts = engine.list_forecasts(horizon)
     if not forecasts:
@@ -119,6 +133,7 @@ def _market_snapshot(horizon: int) -> str:
     return f"""WHOLE-MARKET SNAPSHOT ({horizon}-trading-day horizon, {n} companies tracked):
   breadth: {up} called UP / {n - up} called DOWN ({_fmt_pct(up / n, 0)} up)
   average confidence: {_fmt_pct(avg_conf, 1)}, average |expected move|: {_fmt_pct(avg_move)}
+{_macro_regime_line()}
 TOP GAINERS (by model expected move):
 {chr(10).join(line(f) for f in gainers)}
 TOP DECLINERS (by model expected move):

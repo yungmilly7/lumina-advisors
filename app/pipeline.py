@@ -19,6 +19,12 @@ Per data category, "live" now means:
                 with its own live/synthetic badge, so it doesn't need
                 freshness tracking or to grow that table's schema further.
 
+Macro/market-regime data (VIX + Treasury yield curve) is a separate, one-shot
+ingestion step -- see _ingest_macro below -- rather than a sixth per-ticker
+category: it isn't indexed by ticker at all, so it doesn't fit
+_needed_fields/_fetch_live_ticker's per-company shape, and it's fetched once
+per run (two small HTTP calls total) rather than once per company.
+
 Yahoo's undocumented quoteSummary endpoint (earnings + fundamentals) has
 started getting blocked by Yahoo's anti-bot layer for a large fraction of
 requests as this universe has grown -- Finnhub is a real, licensed API
@@ -42,7 +48,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from app.config import DATA_MODE
-from app.dataclients import demo, finnhub, news, secedgar, yahoo
+from app.dataclients import demo, finnhub, macro, news, secedgar, yahoo
 from app.universe import COMPANIES, TICKERS
 from app import db
 
@@ -200,6 +206,57 @@ def _write_ticker_result(result: dict) -> None:
         db.update_provenance(ticker, result["sources"])
 
 
+def _ingest_macro() -> None:
+    """One-shot (not per-ticker) fetch of VIX + Treasury yield curve.
+
+    Unlike a company's bars/earnings/etc, there's no per-field freshness
+    check here (no `force` parameter) -- this is two small HTTP calls total,
+    not 448, so there's no rate-limit pressure that incremental skipping
+    needs to relieve; it's simplest to just always attempt it fresh. Best-
+    effort with a synthetic fallback in "auto" mode; even "live" mode
+    doesn't raise on a macro-fetch failure the way it does for a ticker
+    with zero bars, since this is supplementary regime context for every
+    company rather than a specific company's own required data.
+    """
+    if DATA_MODE == "demo":
+        db.upsert_macro_series(demo.generate_macro_series())
+        db.set_meta("macro_source", "demo")
+        return
+
+    vix_ok, treasury_ok = True, True
+    try:
+        db.upsert_macro_series(macro.fetch_vix_history())
+    except Exception as e:
+        log.warning("live VIX fetch failed: %s", e)
+        vix_ok = False
+    try:
+        db.upsert_macro_series(macro.fetch_treasury_yield_curve())
+    except Exception as e:
+        log.warning("live Treasury yield curve fetch failed: %s", e)
+        treasury_ok = False
+
+    if not vix_ok or not treasury_ok:
+        if DATA_MODE == "live":
+            log.warning("macro fetch incomplete in live mode; backfilling with synthetic "
+                        "data rather than failing the whole ingestion run over supplementary data")
+        # Only backfill the series that actually failed -- generate_macro_series()
+        # returns all four series in one call, and upsert_macro_series does an
+        # UPSERT keyed on (series, date), so blindly re-upserting everything
+        # here would silently overwrite a just-fetched real VIX (or Treasury)
+        # history with synthetic values on the same dates.
+        synthetic = demo.generate_macro_series()
+        if not vix_ok:
+            db.upsert_macro_series([r for r in synthetic if r["series"] == "vix_close"])
+        if not treasury_ok:
+            db.upsert_macro_series([r for r in synthetic if r["series"] != "vix_close"])
+        db.set_meta(
+            "macro_source",
+            "demo" if not vix_ok and not treasury_ok else "auto (partial live)",
+        )
+    else:
+        db.set_meta("macro_source", "live")
+
+
 def _ingest_demo_all() -> None:
     log.info("generating synthetic demo dataset for %d companies...", len(COMPANIES))
     dataset = demo.generate_universe_demo_data()
@@ -224,6 +281,8 @@ def run_ingestion(force: bool = False) -> dict:
     error: str | None = None
 
     try:
+        _ingest_macro()
+
         if mode == "demo":
             _ingest_demo_all()
             db.set_meta("data_mode_active", "demo")

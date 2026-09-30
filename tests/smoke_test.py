@@ -384,6 +384,106 @@ class TestInsiderTransactionsDbAndDemo(unittest.TestCase):
         self.assertEqual(stored[0]["owner_name"], "Test Owner")
 
 
+_SAMPLE_TREASURY_CSV = (
+    "Date,1 Mo,2 Mo,3 Mo,4 Mo,6 Mo,1 Yr,2 Yr,3 Yr,5 Yr,7 Yr,10 Yr,20 Yr,30 Yr\n"
+    "01/02/2026,5.10,5.08,5.00,4.95,4.80,4.50,4.20,4.15,4.10,4.20,4.30,4.60,4.55\n"
+    "01/05/2026,5.09,5.07,4.98,4.94,4.79,4.48,4.18,4.13,4.08,4.18,4.28,4.58,4.53\n"
+    "01/06/2026,5.08,5.06,N/A,4.93,4.78,4.47,4.17,4.12,4.07,4.17,4.27,4.57,4.52\n"
+)
+
+
+class TestMacroDataClient(unittest.TestCase):
+    """Both macro sources are fetched once per run, not once per ticker (see
+    pipeline._ingest_macro), so their parsing is tested directly against
+    hand-built samples rather than only indirectly through the pipeline."""
+
+    def test_fetch_vix_history_percent_encodes_the_caret_ticker(self):
+        from unittest.mock import patch
+        import app.dataclients.macro as macro
+
+        fake_bars = [
+            {"date": "2026-01-02", "close": 15.5},
+            {"date": "2026-01-05", "close": None},  # must be dropped
+            {"date": "2026-01-06", "close": 16.2},
+        ]
+        with patch("app.dataclients.macro.fetch_daily_bars", return_value=fake_bars) as mock_fetch:
+            rows = macro.fetch_vix_history()
+
+        mock_fetch.assert_called_once()
+        called_ticker = mock_fetch.call_args[0][0]
+        self.assertEqual(called_ticker, "%5EVIX")
+        self.assertEqual(len(rows), 2)  # the None-close row was dropped
+        self.assertTrue(all(r["series"] == "vix_close" for r in rows))
+        self.assertEqual(rows[0]["value"], 15.5)
+
+    def test_fetch_treasury_yield_curve_parses_named_columns_and_skips_n_a(self):
+        from unittest.mock import patch
+        import app.dataclients.macro as macro
+
+        with patch("app.dataclients.macro.get_text", return_value=_SAMPLE_TREASURY_CSV):
+            rows = macro.fetch_treasury_yield_curve(years_back=1)
+
+        by_series_date = {(r["series"], r["date"]): r["value"] for r in rows}
+        self.assertEqual(by_series_date[("yield_10y", "2026-01-02")], 4.30)
+        self.assertEqual(by_series_date[("yield_2y", "2026-01-05")], 4.18)
+        # 01/06 has "N/A" for 3 Mo -- must be skipped, not coerced to 0 or NaN.
+        self.assertNotIn(("yield_3m", "2026-01-06"), by_series_date)
+        self.assertIn(("yield_2y", "2026-01-06"), by_series_date)
+
+    def test_demo_macro_series_is_deterministic_and_covers_all_four_series(self):
+        from app.dataclients import demo
+
+        rows_a = demo.generate_macro_series()
+        rows_b = demo.generate_macro_series()
+        self.assertEqual(rows_a, rows_b)
+        series_present = {r["series"] for r in rows_a}
+        self.assertEqual(series_present, {"vix_close", "yield_3m", "yield_2y", "yield_10y"})
+        vix_values = [r["value"] for r in rows_a if r["series"] == "vix_close"]
+        self.assertTrue(all(v > 0 for v in vix_values))
+
+
+class TestMacroFeaturesAndPipeline(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from app.engine import engine
+
+        if not engine.ready:
+            engine.bootstrap()
+        cls.engine = engine
+
+    def test_macro_feature_columns_present_broadcast_and_finite(self):
+        panel = self.engine.panel
+        for name in ("vix_level", "vix_change_5d", "yield_curve_10y_2y", "yield_curve_10y_3m"):
+            self.assertIn(name, panel.features)
+            df = panel.features[name]
+            self.assertTrue(np.isfinite(df.to_numpy()).all(), f"{name} has non-finite values")
+            # Broadcast macro context: every ticker column should be
+            # identical on a given date, since this isn't a per-company signal.
+            latest = df.iloc[-1]
+            self.assertEqual(latest.nunique(), 1, f"{name} should be identical across tickers")
+
+    def test_partial_live_macro_failure_does_not_clobber_the_series_that_succeeded(self):
+        # Regression test: the fallback path used to re-upsert ALL four
+        # synthetic series whenever EITHER VIX or Treasury failed, which
+        # would silently overwrite a just-fetched real VIX (or Treasury)
+        # history with synthetic values on the same dates. Only the series
+        # that actually failed should ever be backfilled.
+        from unittest import mock
+
+        from app import db, pipeline
+        from app.dataclients import macro as macro_client
+
+        real_vix_rows = [{"series": "vix_close", "date": "2026-01-02", "value": 12.34}]
+
+        with mock.patch.object(pipeline, "DATA_MODE", "auto"), \
+             mock.patch.object(macro_client, "fetch_vix_history", return_value=real_vix_rows), \
+             mock.patch.object(macro_client, "fetch_treasury_yield_curve", side_effect=RuntimeError("boom")):
+            pipeline._ingest_macro()
+
+        stored = {r["date"]: r["value"] for r in db.get_macro_series("vix_close")}
+        self.assertEqual(stored.get("2026-01-02"), 12.34)  # untouched by the Treasury-side fallback
+
+
 class TestYahooCrumbHandshake(unittest.TestCase):
     """Regression test: fc.yahoo.com's cookie-seed request routinely answers
     with a 404 (it's an edge/accelerator endpoint, not a real page) while

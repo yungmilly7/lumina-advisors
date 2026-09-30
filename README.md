@@ -57,6 +57,9 @@ app/
     secedgar.py     live SEC filings (10-K/10-Q/8-K) via EDGAR's JSON API,
                     plus open-market insider buy/sell transactions parsed
                     out of Form 4 filings (see "Insider transactions" below)
+    macro.py        live VIX + Treasury yield curve -- one shared market-
+                    regime signal for the whole universe, not per-company
+                    (see "Macro/market regime signal" below)
     news.py         Google News RSS + a transparent lexicon-based
                     sentiment/event-tag scorer (no ML black box, no API key)
     demo.py         deterministic synthetic data generator -- same
@@ -70,9 +73,10 @@ app/
   signals.py       turns raw data into a per-company/day feature panel:
                    momentum, volatility, RSI, volume anomalies, earnings
                    timing, decayed news sentiment, sector/market momentum,
-                   insider buy/sell balance, and the graph spillover features
-                   (a matrix multiply of neighbor momentum/sentiment against
-                   the relationship graph's signed, weighted adjacency matrix)
+                   insider buy/sell balance, VIX/yield-curve macro regime,
+                   and the graph spillover features (a matrix multiply of
+                   neighbor momentum/sentiment against the relationship
+                   graph's signed, weighted adjacency matrix)
   ml.py            small pure-numpy StandardScaler / RidgeRegression /
                    LogisticRegression / Pipeline -- see "Why zero
                    dependencies" below
@@ -207,6 +211,27 @@ ever reaches the model. Like filings and news, it's fetched best-effort on
 every run rather than tracked for "freshness" -- an empty result usually
 just means that company's insiders haven't made an open-market trade
 recently, which is a real, common state, not a fetch failure.
+
+## Macro/market regime signal
+
+Every forecast also sees four shared, market-wide features: `vix_level` and
+`vix_change_5d` (the VIX volatility/fear-gauge index and its 5-day change),
+and `yield_curve_10y_2y` / `yield_curve_10y_3m` (the two classic Treasury
+yield-curve-inversion spreads -- 10y-2y is the most commonly cited, 10y-3mo
+is the New York Fed's own preferred recession indicator). Unlike every other
+feature, these are identical across every company on a given date -- it's
+shared regime context, not a per-company signal, the same way `market_mom_5`
+already broadcasts the cross-sectional average momentum to every ticker.
+
+Both sources are free and keyless: VIX comes from the same Yahoo Finance
+chart endpoint already used for equity prices (just pointed at the `^VIX`
+index), and the yield curve comes from Treasury.gov's own published CSV
+export. Fetched once per ingestion run (two small HTTP calls total), not
+once per company -- there's no per-ticker rate-limit pressure to manage
+here, so unlike bars/earnings/fundamentals this has no freshness window and
+just always re-fetches fresh. A fetch failure for either source falls back
+to a synthetic series for exactly that source (never both, and never
+clobbering the other source's real data) rather than failing the run.
 
 ## Adding the AI narrative layer and chat
 

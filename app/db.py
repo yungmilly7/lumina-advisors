@@ -216,6 +216,21 @@ CREATE TABLE IF NOT EXISTS insider_transactions (
     PRIMARY KEY (ticker, transaction_date, owner_name, transaction_code, shares)
 );
 CREATE INDEX IF NOT EXISTS idx_insider_txn_ticker_date ON insider_transactions(ticker, transaction_date);
+
+-- Market-wide (not per-ticker) macro/regime series: VIX close and a few
+-- Treasury par-yield tenors. One row per (series, date) rather than one
+-- column per series so adding another series later (e.g. a credit spread)
+-- is a data change, not a schema migration. Fetched once per ingestion run
+-- -- see app.pipeline's _ingest_macro -- not once per ticker, since this is
+-- shared context broadcast to every company's feature row (see
+-- app.signals._macro_features).
+CREATE TABLE IF NOT EXISTS macro_series (
+    series TEXT NOT NULL,   -- vix_close | yield_3m | yield_2y | yield_10y
+    date TEXT NOT NULL,
+    value REAL,
+    PRIMARY KEY (series, date)
+);
+CREATE INDEX IF NOT EXISTS idx_macro_series_series_date ON macro_series(series, date);
 """
 
 
@@ -366,6 +381,36 @@ def get_insider_transactions(ticker: str, limit: int = 50) -> list[sqlite3.Row]:
         "ORDER BY transaction_date DESC LIMIT ?",
         (ticker, limit),
     ).fetchall()
+
+
+def upsert_macro_series(rows: list[dict]) -> None:
+    """`rows`: [{series, date, value}, ...], any mix of series in one call."""
+    if not rows:
+        return
+    with tx() as conn:
+        conn.executemany(
+            "INSERT INTO macro_series(series, date, value) VALUES (:series, :date, :value) "
+            "ON CONFLICT(series, date) DO UPDATE SET value=excluded.value",
+            rows,
+        )
+
+
+def get_macro_series(series: str) -> list[sqlite3.Row]:
+    return get_conn().execute(
+        "SELECT date, value FROM macro_series WHERE series=? ORDER BY date ASC",
+        (series,),
+    ).fetchall()
+
+
+def latest_macro_values() -> dict[str, float | None]:
+    """Most recent value of each macro series, for a quick snapshot (e.g.
+    the chat widget's market summary) without pulling a whole history."""
+    rows = get_conn().execute(
+        "SELECT series, value FROM macro_series m WHERE date = "
+        "(SELECT MAX(date) FROM macro_series WHERE series = m.series) "
+        "GROUP BY series"
+    ).fetchall()
+    return {r["series"]: r["value"] for r in rows}
 
 
 def upsert_news(ticker: str, rows: list[dict]) -> None:

@@ -77,6 +77,10 @@ FACTOR_LABELS = {
     "filing_count_30d": "SEC filing activity (30d)",
     "insider_net_buy_ratio_90d": "insider open-market buy/sell balance (90d)",
     "insider_buy_count_90d": "insider open-market buys (90d)",
+    "vix_level": "VIX (market volatility/fear gauge)",
+    "vix_change_5d": "VIX 5-day change (volatility regime shift)",
+    "yield_curve_10y_2y": "Treasury yield curve (10y-2y spread)",
+    "yield_curve_10y_3m": "Treasury yield curve (10y-3mo spread)",
 }
 
 
