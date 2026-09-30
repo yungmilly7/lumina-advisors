@@ -12,6 +12,17 @@
 #     (accounts/watchlists) resets whenever you push a new version. Fine
 #     for a demo/portfolio site; see DEPLOY.md if this ever needs to survive
 #     redeploys.
+#   - STOCKGRAPH_DATA_MODE is "demo" here (not "auto" like a local run) --
+#     confirmed live: Yahoo Finance throttles/blocks Render's shared IPs
+#     far more aggressively than a home connection, so "auto" mode's
+#     per-ticker live fetch across 448 companies took 15+ minutes on this
+#     free instance (vs. under a minute locally) before falling back to
+#     demo data for most of them anyway. Since the free tier has no
+#     persistent disk, that slow re-fetch would repeat on every wake from
+#     sleep, not just on redeploys. "demo" boots instantly and reliably,
+#     and is clearly labeled as synthetic data everywhere it appears --
+#     switch back to "auto" only on a paid plan with a dedicated/static
+#     outbound IP, where Yahoo is less likely to throttle it.
 services:
   - type: web
     name: lumina-advisors
@@ -25,7 +36,7 @@ services:
       - key: STOCKGRAPH_HOST
         value: 0.0.0.0
       - key: STOCKGRAPH_DATA_MODE
-        value: auto
+        value: demo
       - key: SEC_USER_AGENT
         value: "Lumina Advisors (contact: set-your-email@example.com)"
       - key: ANTHROPIC_API_KEY

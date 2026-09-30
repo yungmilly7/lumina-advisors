@@ -82,12 +82,18 @@ narrative and the chat widget to work on the live site too:
   is a Render **paid** plan with a persistent disk, or moving to a small
   hosted Postgres database instead of SQLite -- not something to worry
   about for a portfolio/demo site.
-- **Data mode is `auto`** (same default as running it locally): it tries
-  live Yahoo/SEC/Google News data per company and quietly fills in
-  synthetic data only for whatever it can't reach, so the site still
-  looks complete even if Render's shared IP gets rate-limited by one of
-  those sources sometimes. The badge in the top-right always tells you
-  which is actually active.
+- **Data mode is `demo`, not `auto`.** It started as `auto` (same as
+  running it locally), but Yahoo Finance throttles Render's shared IPs
+  much harder than a home connection -- the first live boot took 15+
+  minutes and still ended up mostly demo-fallback anyway. Since the free
+  tier has no persistent disk, that slow re-fetch would repeat every time
+  the site wakes from sleep, not just on redeploys. `demo` boots
+  instantly and never depends on those outside services being reachable
+  or fast; it's clearly labeled as synthetic data everywhere it appears
+  (the badge in the top-right always shows which mode is active). Your
+  own laptop can still run `auto`/live for your own use -- this only
+  affects the public Render deployment. Revisit `auto` here if you ever
+  move to a paid Render plan with a static outbound IP.
 
 ## Updating the live site later
 
