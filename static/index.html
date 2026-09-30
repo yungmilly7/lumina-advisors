@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lumina Advisors — explainable stock forecasts from a company relationship graph</title>
+<meta name="description" content="Lumina Advisors forecasts stock direction and move size for 232+ public companies by modeling their real supplier/customer/competitor/partner relationships as a graph -- with a plain-English rationale and a tracked, honest accuracy scorecard for every call." />
+<meta property="og:title" content="Lumina Advisors" />
+<meta property="og:description" content="Explainable stock forecasts built on a real company relationship graph -- every call comes with a plain-English rationale and a tracked accuracy scorecard." />
+<meta property="og:type" content="website" />
+<meta name="theme-color" content="#0f1520" />
+<link rel="icon" type="image/svg+xml" href="favicon.svg" />
+<link rel="stylesheet" href="app.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">◎</span>
+    <span class="brand-name">Lumina <em>Advisors</em></span>
+  </div>
+  <div class="global-search-wrap">
+    <input id="globalSearch" class="search-box global-search-input" type="text" placeholder="Jump to a company… (ticker or name)" autocomplete="off" aria-label="Jump to a company" />
+    <div id="globalSearchResults" class="autocomplete-results hidden"></div>
+  </div>
+  <div class="topbar-controls">
+    <label class="horizon-select">
+      Horizon
+      <select id="horizonSelect">
+        <option value="1">1 day</option>
+        <option value="5" selected>5 days</option>
+        <option value="20">20 days</option>
+      </select>
+    </label>
+    <span id="modeBadge" class="badge badge-neutral">loading…</span>
+    <button id="refreshBtn" class="btn btn-ghost">Refresh data</button>
+    <button id="helpBtn" class="btn btn-icon" title="Help &amp; glossary" aria-label="Help and glossary">?</button>
+    <button id="themeToggleBtn" class="btn btn-icon" title="Toggle light/dark theme" aria-label="Toggle theme">◐</button>
+    <div id="authArea" class="auth-area"></div>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="graph">Relationship Graph</button>
+  <button class="tab-btn" data-tab="forecasts">All Forecasts</button>
+  <button class="tab-btn" data-tab="compare">Compare</button>
+  <button class="tab-btn" data-tab="watchlist">Watchlist<span id="watchlistCount" class="tab-count hidden">0</span></button>
+  <button class="tab-btn" data-tab="scorecard">Model Scorecard</button>
+  <button class="tab-btn" data-tab="datahealth">Data Health</button>
+</nav>
+
+<div id="loadingBanner" class="loading-banner hidden" role="status" aria-live="polite">
+  <div class="spinner"></div>
+  <span id="loadingText">Running the pipeline (ingest → features → train → backtest)…</span>
+  <span id="loadingElapsed" class="loading-elapsed"></span>
+</div>
+
+<div id="loadErrorBanner" class="load-error-banner hidden" role="alert">
+  <span id="loadErrorText">Couldn't load the site's data.</span>
+  <button id="loadErrorRetryBtn" class="btn btn-ghost btn-sm">Try again</button>
+</div>
+
+<div id="marketOverview" class="market-overview">
+  <div class="overview-stats" id="overviewStats"></div>
+  <div class="overview-movers">
+    <div class="movers-col">
+      <div class="movers-title movers-up">Top gainers (model call)</div>
+      <div id="topGainers" class="movers-list"></div>
+    </div>
+    <div class="movers-col">
+      <div class="movers-title movers-down">Top decliners (model call)</div>
+      <div id="topDecliners" class="movers-list"></div>
+    </div>
+  </div>
+</div>
+
+<main>
+  <section id="tab-graph" class="tab-panel active">
+    <div class="graph-layout">
+      <div class="graph-panel">
+        <div class="panel-head">
+          <h2>Company relationship graph</h2>
+          <p class="hint">Node color = sector · node size = model conviction · edge style = relationship type. Click a company to see its forecast.</p>
+        </div>
+        <div id="network" class="network">
+          <canvas id="networkCanvas"></canvas>
+          <div id="networkTooltip" class="network-tooltip hidden"></div>
+          <div class="network-hint">scroll to zoom · drag to pan · drag a node to move it</div>
+        </div>
+        <div class="legend-row">
+          <div class="legend" id="edgeLegend"></div>
+          <div class="legend" id="sectorLegend"></div>
+        </div>
+      </div>
+      <aside id="detailPanel" class="detail-panel">
+        <div class="detail-empty">Click any company in the graph, or search below, to see its forecast.</div>
+      </aside>
+    </div>
+  </section>
+
+  <section id="tab-forecasts" class="tab-panel">
+    <div class="panel-head">
+      <h2>All forecasts</h2>
+      <div class="panel-head-controls">
+        <input id="forecastSearch" class="search-box" type="text" placeholder="Filter by ticker, name, or sector…" />
+        <button id="exportCsvBtn" class="btn btn-ghost">Export CSV</button>
+      </div>
+    </div>
+    <div class="chip-filter-row" id="sectorFilterRow"></div>
+    <div class="chart-panel">
+      <div class="chart-title">Sector performance — average expected move by sector</div>
+      <canvas id="sectorPerfCanvas" class="chart-canvas"></canvas>
+    </div>
+    <div class="table-wrap">
+      <table id="forecastTable" class="data-table">
+        <thead>
+          <tr>
+            <th></th>
+            <th data-sort="ticker">Ticker</th>
+            <th data-sort="name">Company</th>
+            <th data-sort="sector">Sector</th>
+            <th data-sort="direction" title="The model's predicted direction over the selected horizon">Call</th>
+            <th data-sort="prob_up" title="Model-estimated probability the price finishes higher at the end of the horizon">P(up)</th>
+            <th data-sort="expected_move_pct" title="The model's predicted price change over the horizon">Expected move</th>
+            <th data-sort="confidence" title="How strongly the model leans one way, weighted by how accurate this model has actually been on held-out data -- not a guarantee">Confidence</th>
+            <th data-sort="base_price" title="Most recent closing price">Price</th>
+            <th data-sort="target_price" title="Base price adjusted by the expected move">Target</th>
+          </tr>
+        </thead>
+        <tbody id="forecastTableBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-compare" class="tab-panel">
+    <div class="panel-head">
+      <h2>Compare companies</h2>
+      <p class="hint">Pick 2–4 companies to see their forecasts, drivers, and fundamentals side by side.</p>
+    </div>
+    <div id="comparePickerRow" class="compare-picker-row"></div>
+    <div id="compareEmpty" class="empty-state">
+      <div class="empty-state-icon">⇄</div>
+      <p>Pick at least two companies above to compare them.</p>
+    </div>
+    <div id="compareContent" class="hidden">
+      <div class="chart-panel">
+        <div class="chart-title">Expected move by horizon — selected companies</div>
+        <canvas id="compareMoveCanvas" class="chart-canvas"></canvas>
+      </div>
+      <div class="table-wrap">
+        <table id="compareTable" class="data-table compare-table"></table>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-watchlist" class="tab-panel">
+    <div class="panel-head">
+      <h2>Your watchlist</h2>
+      <p class="hint">Companies you've starred. Sign in to keep this list saved to your account.</p>
+    </div>
+    <div id="watchlistSignedOut" class="empty-state hidden">
+      <div class="empty-state-icon">★</div>
+      <p>Sign in to build a watchlist and keep it saved between visits.</p>
+      <button class="btn" id="watchlistSignInBtn">Sign in</button>
+    </div>
+    <div id="watchlistEmpty" class="empty-state hidden">
+      <div class="empty-state-icon">☆</div>
+      <p>No companies starred yet. Star any ticker from the forecasts table or a company's detail panel to add it here.</p>
+    </div>
+    <div id="watchlistDiversification" class="diversification-box hidden">
+      <h3>Diversification check</h3>
+      <p class="hint" style="margin-top:-4px;">How concentrated your starred companies are, using the same relationship graph that feeds the model — because a portfolio that's really one bet wearing several tickers isn't diversified.</p>
+      <div id="diversificationSectorBar" class="health-source-bar diversification-bar"></div>
+      <div id="diversificationSectorLegend" class="legend"></div>
+      <div id="diversificationLinks"></div>
+    </div>
+    <div class="table-wrap hidden" id="watchlistTableWrap">
+      <table id="watchlistTable" class="data-table">
+        <thead>
+          <tr>
+            <th></th>
+            <th data-sort="ticker">Ticker</th>
+            <th data-sort="name">Company</th>
+            <th data-sort="sector">Sector</th>
+            <th data-sort="direction" title="The model's predicted direction over the selected horizon">Call</th>
+            <th data-sort="prob_up" title="Model-estimated probability the price finishes higher at the end of the horizon">P(up)</th>
+            <th data-sort="expected_move_pct" title="The model's predicted price change over the horizon">Expected move</th>
+            <th data-sort="confidence" title="How strongly the model leans one way, weighted by how accurate this model has actually been on held-out data -- not a guarantee">Confidence</th>
+            <th data-sort="base_price" title="Most recent closing price">Price</th>
+            <th data-sort="target_price" title="Base price adjusted by the expected move">Target</th>
+          </tr>
+        </thead>
+        <tbody id="watchlistTableBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-scorecard" class="tab-panel">
+    <div class="panel-head">
+      <h2>Model scorecard</h2>
+      <p class="hint">Walk-forward accuracy on data the model never trained on. This is the honest measure of whether the forecasts are worth anything — read it before trusting any single prediction.</p>
+    </div>
+    <div id="scorecardSummary" class="score-summary"></div>
+    <div class="chart-panel">
+      <div class="chart-title">Confidence distribution across all current forecasts</div>
+      <canvas id="confidenceHistCanvas" class="chart-canvas"></canvas>
+    </div>
+    <div class="chart-panel">
+      <div class="chart-title">Direction hit rate by horizon</div>
+      <canvas id="hitRateCanvas" class="chart-canvas"></canvas>
+    </div>
+    <div class="scorecard-grid">
+      <div>
+        <h3>By horizon</h3>
+        <div class="table-wrap">
+          <table class="data-table" id="scByHorizon"><thead><tr><th>Horizon</th><th title="Number of held-out predictions this is based on">N</th><th title="Share of held-out predictions where the model got the up/down direction right">Direction hit rate</th><th title="Average absolute difference between predicted and actual price move, in percentage points">Mean abs. error</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+      <div>
+        <h3>By company (top 20 by sample size)</h3>
+        <div class="table-wrap">
+          <table class="data-table" id="scByTicker"><thead><tr><th>Ticker</th><th title="Number of held-out predictions this is based on">N</th><th title="Share of held-out predictions where the model got the up/down direction right">Hit rate</th><th title="Mean absolute error -- average difference between predicted and actual price move, in percentage points">MAE</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-datahealth" class="tab-panel">
+    <div class="panel-head">
+      <h2>Data health</h2>
+      <p class="hint">Where each company's numbers actually come from right now — live market data or the synthetic demo generator — per field, plus the ingestion pipeline's own recent run history. This is the honest, per-field version of the badge at the top of the page.</p>
+    </div>
+    <div id="healthSummary" class="health-summary"></div>
+    <div class="health-grid">
+      <div>
+        <h3>Live coverage by data type</h3>
+        <div class="table-wrap">
+          <table class="data-table" id="healthSourceTable"><thead><tr><th>Field</th><th>Live coverage</th><th title="Which provider is backing each field, and how many companies">Sources</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+      <div>
+        <h3>Recent ingestion runs</h3>
+        <div class="table-wrap">
+          <table class="data-table" id="healthRunsTable"><thead><tr><th>Started</th><th>Mode</th><th title="Companies whose bars fetch succeeded (or were skipped as already-fresh) this run">OK</th><th title="Companies whose bars fetch failed this run">Fail</th><th title="Ticker/field combinations skipped because they were already fresh">Skipped (fresh)</th><th>Elapsed</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="disclaimer">
+  <strong>Not investment advice.</strong> Forecasts are generated by a statistical model trained on a limited feature set (price action, sentiment, earnings timing, and the relationship graph)<span id="disclaimerDataNote"> — the badge above shows whether this instance is currently running on live market data or synthetic demo data</span>. The scorecard tab shows the model's actual, honestly-measured accuracy — markets are hard to predict, and you should treat every number here as a probabilistic estimate, not a guarantee.
+</footer>
+
+<div id="authModalBackdrop" class="modal-backdrop hidden">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="authModalTitle">
+    <button class="modal-close" id="authModalClose" aria-label="Close">×</button>
+    <div class="modal-tabs">
+      <button class="modal-tab-btn active" data-authtab="login">Sign in</button>
+      <button class="modal-tab-btn" data-authtab="signup">Create account</button>
+    </div>
+    <h3 id="authModalTitle" class="hidden">Account</h3>
+    <form id="authForm">
+      <div id="signupNameRow" class="field hidden">
+        <label for="authDisplayName">Name</label>
+        <input id="authDisplayName" type="text" autocomplete="name" placeholder="What should we call you?" />
+      </div>
+      <div class="field">
+        <label for="authEmail">Email</label>
+        <input id="authEmail" type="email" autocomplete="email" required placeholder="you@example.com" />
+      </div>
+      <div class="field">
+        <label for="authPassword">Password</label>
+        <input id="authPassword" type="password" autocomplete="current-password" required placeholder="At least 8 characters" minlength="8" />
+      </div>
+      <div id="authError" class="form-error hidden"></div>
+      <button type="submit" class="btn btn-block" id="authSubmitBtn">Sign in</button>
+    </form>
+  </div>
+</div>
+
+<div id="surveyModalBackdrop" class="modal-backdrop hidden">
+  <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="surveyModalTitle">
+    <button class="modal-close" id="surveyModalClose" aria-label="Close">×</button>
+    <h3 id="surveyModalTitle">Your investor profile</h3>
+    <p class="hint" style="margin-top:-6px;">A few quick questions so the site can highlight what's relevant to you — sort forecasts toward sectors you care about, and tailor the chat assistant. Nothing here is investment advice, and you can change it anytime from your account menu.</p>
+    <form id="surveyForm">
+      <div class="field">
+        <label>What are you looking to do? <span class="hint-inline">(pick any that apply)</span></label>
+        <div class="check-grid" id="surveyGoals">
+          <label><input type="checkbox" name="goals" value="growth" /> Grow my money long-term</label>
+          <label><input type="checkbox" name="goals" value="income" /> Generate income (dividends)</label>
+          <label><input type="checkbox" name="goals" value="value" /> Find undervalued companies</label>
+          <label><input type="checkbox" name="goals" value="speculation" /> Trade shorter-term moves</label>
+          <label><input type="checkbox" name="goals" value="learning" /> Just learning how investing works</label>
+        </div>
+      </div>
+      <div class="field">
+        <label>How would you describe your risk tolerance?</label>
+        <div class="check-grid">
+          <label><input type="radio" name="risk_tolerance" value="conservative" /> Conservative — protect what I have</label>
+          <label><input type="radio" name="risk_tolerance" value="moderate" /> Moderate — balanced</label>
+          <label><input type="radio" name="risk_tolerance" value="aggressive" /> Aggressive — comfortable with big swings</label>
+        </div>
+      </div>
+      <div class="field">
+        <label>What time horizon are you investing on?</label>
+        <div class="check-grid">
+          <label><input type="radio" name="horizon" value="short" /> Short-term (days to weeks)</label>
+          <label><input type="radio" name="horizon" value="medium" /> Medium-term (months)</label>
+          <label><input type="radio" name="horizon" value="long" /> Long-term (a year or more)</label>
+        </div>
+      </div>
+      <div class="field">
+        <label>How much investing experience do you have?</label>
+        <div class="check-grid">
+          <label><input type="radio" name="experience" value="new" /> New to this</label>
+          <label><input type="radio" name="experience" value="some" /> Some experience</label>
+          <label><input type="radio" name="experience" value="experienced" /> Experienced</label>
+        </div>
+      </div>
+      <div class="field">
+        <label>Which sectors are you most interested in? <span class="hint-inline">(pick any)</span></label>
+        <div class="check-grid check-grid-scroll" id="surveySectorsList"></div>
+      </div>
+      <div id="surveyError" class="form-error hidden"></div>
+      <div class="survey-actions">
+        <button type="button" class="btn btn-ghost" id="surveySkipBtn">Skip for now</button>
+        <button type="submit" class="btn" id="surveySaveBtn">Save profile</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div id="helpModalBackdrop" class="modal-backdrop hidden">
+  <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="helpModalTitle">
+    <button class="modal-close" id="helpModalClose" aria-label="Close">×</button>
+    <h3 id="helpModalTitle">How to use Lumina Advisors</h3>
+    <p class="hint" style="margin-top:-6px;">A quick guide to the site and the terms you'll see on it.</p>
+    <div class="help-section">
+      <h4>Getting around</h4>
+      <ul class="help-list">
+        <li><strong>Jump to a company</strong> — use the search box at the top of the page anytime; type a ticker or company name and pick it from the dropdown.</li>
+        <li><strong>Relationship Graph</strong> — every company as a node, sized by how confident the model is and colored by sector. Click a node (or search) to open its forecast.</li>
+        <li><strong>All Forecasts</strong> — every company in one sortable, filterable table. Click a row to see the full breakdown.</li>
+        <li><strong>Compare</strong> — put 2–4 companies side by side: same metrics, same horizon, easy to eyeball.</li>
+        <li><strong>Watchlist</strong> — star any company to track it here (sign in to keep it saved between visits). Once you've starred 2+, a diversification check shows sector concentration and any direct supplier/customer/competitor/partner links between your picks.</li>
+        <li><strong>Model Scorecard</strong> — the model's actual, honestly-measured accuracy on data it never trained on. Check this before trusting any single call.</li>
+        <li><strong>Data Health</strong> — shows, per company and per data field, whether you're looking at live market data or the synthetic demo generator.</li>
+      </ul>
+    </div>
+    <div class="help-section">
+      <h4>Reading a forecast</h4>
+      <ul class="help-list">
+        <li><strong>Call</strong> — the model's predicted direction (up/down) over the selected horizon.</li>
+        <li><strong>P(up)</strong> — the model's estimated probability the price finishes higher at the end of the horizon. 50% means a coin flip; further from 50% means a stronger lean.</li>
+        <li><strong>Expected move</strong> — the model's predicted percentage price change over the horizon.</li>
+        <li><strong>Confidence</strong> — how strongly the model leans one way, weighted by how accurate this model has actually been historically. Not a guarantee — always check the Scorecard.</li>
+        <li><strong>Drivers</strong> — the specific inputs (momentum, sentiment, earnings timing, connected-company spillover, etc.) that pushed the call up or down, and by how much. Hover the ⓘ next to any driver for a plain-English explanation.</li>
+        <li><strong>Live vs. Demo</strong> — a green "Live · source" tag means that field is backed by a real market data provider right now; a yellow "Demo" tag means synthetic data is filling in (usually because a provider is temporarily unreachable). See the Data Health tab for the full picture.</li>
+      </ul>
+    </div>
+    <div class="help-section">
+      <h4>What this is (and isn't)</h4>
+      <p style="font-size:13px;color:var(--text-muted);">Lumina Advisors models each company's real supplier, customer, competitor, and partner relationships as a graph, and lets momentum, sentiment, and earnings signals flow between connected companies when forecasting. Every call comes with a plain-English rationale so you can see <em>why</em>, not just what. It is <strong>not investment advice</strong> — it's a statistical model with a tracked, honestly-measured accuracy record. Treat every number as a probability, not a promise.</p>
+    </div>
+  </div>
+</div>
+
+<div id="toastStack" class="toast-stack" role="status" aria-live="polite"></div>
+
+<button id="chatFab" class="chat-fab" aria-label="Ask the AI research assistant" title="Ask a question about the forecasts">
+  <span class="chat-fab-icon">💬</span>
+</button>
+<div id="chatPanel" class="chat-panel hidden" role="dialog" aria-label="AI research assistant">
+  <div class="chat-panel-head">
+    <div>
+      <div class="chat-panel-title">Ask about the data</div>
+      <div class="chat-panel-sub" id="chatScopeLabel">Whole market</div>
+    </div>
+    <button class="modal-close" id="chatCloseBtn" aria-label="Close chat">×</button>
+  </div>
+  <div class="chat-messages" id="chatMessages" role="log" aria-live="polite" aria-relevant="additions">
+    <div class="chat-msg chat-msg-assistant">
+      Ask me anything about the forecasts, drivers, or news on this site — e.g. "why is NVDA called up?" or
+      "which sector looks weakest right now?" I only answer from this site's own data, not outside knowledge.
+    </div>
+  </div>
+  <form id="chatForm" class="chat-form">
+    <input id="chatInput" type="text" placeholder="Ask a question…" aria-label="Ask a question about the forecasts" autocomplete="off" maxlength="2000" />
+    <button type="submit" class="btn" id="chatSendBtn">Send</button>
+  </form>
+</div>
+
+<script src="graph.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

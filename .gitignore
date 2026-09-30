@@ -1,0 +1,22 @@
+# Local SQLite database (accounts, watchlists, cached market data) --
+# generated on first run, never committed. On a host with ephemeral disk
+# (see DEPLOY.md) this resets on every redeploy; that's expected.
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Local secrets/config -- .env.example is the template that IS committed,
+# but a real .env (API keys, SEC contact email) never should be.
+.env
+
+# Editor/OS cruft
+.vscode/
+.DS_Store
+Thumbs.db

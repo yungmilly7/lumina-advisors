@@ -1,0 +1,32 @@
+# Render.com Blueprint -- https://render.com/docs/blueprint-spec
+#
+# Render auto-detects this file when you connect the repo and offers to
+# create everything below with one click ("New +" -> "Blueprint"). See
+# DEPLOY.md for the full step-by-step walkthrough.
+#
+# Free plan notes (see DEPLOY.md for details):
+#   - No credit card required.
+#   - Spins down after 15 min of no traffic, then takes ~30-60s to wake back
+#     up on the next visit (bootstrap runs before the site responds).
+#   - Local disk is not persistent across deploys, so the SQLite database
+#     (accounts/watchlists) resets whenever you push a new version. Fine
+#     for a demo/portfolio site; see DEPLOY.md if this ever needs to survive
+#     redeploys.
+services:
+  - type: web
+    name: lumina-advisors
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python run.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: STOCKGRAPH_HOST
+        value: 0.0.0.0
+      - key: STOCKGRAPH_DATA_MODE
+        value: auto
+      - key: SEC_USER_AGENT
+        value: "Lumina Advisors (contact: set-your-email@example.com)"
+      - key: ANTHROPIC_API_KEY
+        sync: false

@@ -1,0 +1,7 @@
+# Zero third-party web/ML dependencies by design -- see app/httpserver.py
+# and app/ml.py. This keeps the whole project runnable in places where
+# `pip install` isn't possible (locked-down/managed-device networks): only
+# numpy and pandas are needed, and both are extremely commonly already
+# installed (e.g. via Anaconda).
+pandas>=2.0
+numpy>=1.24
