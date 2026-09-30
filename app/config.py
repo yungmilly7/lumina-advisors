@@ -124,3 +124,36 @@ TRADING_POSITION_USD = float(os.environ.get("STOCKGRAPH_TRADING_POSITION_USD", "
 # already worse than -this fraction, skip opening any new positions for
 # the rest of that pass.
 TRADING_MAX_DAILY_LOSS_PCT = float(os.environ.get("STOCKGRAPH_TRADING_MAX_DAILY_LOSS_PCT", "0.03"))
+
+# Recommendations ("what to invest in, when, why, how much" -- app.recommend):
+# a read-only ranking + sizing layer on top of the same forecasts everything
+# else on the site already shows. Unlike TRADING_MIN_CONFIDENCE above, there
+# is deliberately no confidence/move floor that could return zero picks --
+# this always surfaces the best *available* signals today and labels how
+# strong they actually are (see recommend.py's signal_strength), rather than
+# silently going empty. That matters because this model's confidence values
+# run much lower in "demo" mode (synthetic data, holdout accuracy near a coin
+# flip) than they might against real live data -- a fixed absolute floor
+# tuned for one would misbehave in the other.
+RECO_MAX_PICKS = int(os.environ.get("STOCKGRAPH_RECO_MAX_PICKS", "10"))
+# Default horizon a fresh /api/recommendations call uses if none is given --
+# matches the site's other default (HORIZONS[1] in forecast.py).
+RECO_DEFAULT_HORIZON_DAYS = int(os.environ.get("STOCKGRAPH_RECO_DEFAULT_HORIZON", "5"))
+# No single position may be sized above this fraction of the investable
+# pool, however high its conviction score -- basic diversification even
+# when one ticker dominates the ranking.
+RECO_MAX_POSITION_PCT = float(os.environ.get("STOCKGRAPH_RECO_MAX_POSITION_PCT", "0.25"))
+# Fraction of the configured portfolio size held back as cash rather than
+# allocated across picks -- a small built-in buffer, not a recommendation
+# to go 100% invested.
+RECO_CASH_RESERVE_PCT = float(os.environ.get("STOCKGRAPH_RECO_CASH_RESERVE_PCT", "0.10"))
+# Optional hard floors, off (0.0) by default -- see the note above on why a
+# floor tuned for live-mode confidence would zero out demo mode. Set these
+# via env if running against real live data and you want them enforced.
+RECO_MIN_CONFIDENCE = float(os.environ.get("STOCKGRAPH_RECO_MIN_CONFIDENCE", "0.0"))
+RECO_MIN_MOVE_PCT = float(os.environ.get("STOCKGRAPH_RECO_MIN_MOVE_PCT", "0.0"))
+# Default hypothetical portfolio size ($) sizing is computed against, until
+# the user sets their own via the Recommendations page (stored in the meta
+# table, see app.recommend.portfolio_size/set_portfolio_size). Purely a
+# paper/planning number -- nothing here executes a trade.
+RECO_DEFAULT_PORTFOLIO_USD = float(os.environ.get("STOCKGRAPH_RECO_DEFAULT_PORTFOLIO_USD", "10000"))

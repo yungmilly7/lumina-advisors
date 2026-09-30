@@ -10,6 +10,7 @@ import logging
 
 from app import auth, chat, db
 from app.config import BASE_DIR
+from app.config import RECO_DEFAULT_HORIZON_DAYS
 from app.engine import engine
 from app.forecast import HORIZONS
 from app.httpserver import JSONResponse, Router
@@ -244,6 +245,49 @@ def refresh(request):
     return JSONResponse(engine.status())
 
 
+def recommendations(request):
+    """Ranked, sized "what to invest in" picks -- see app.recommend for the
+    ranking/sizing methodology. `horizon` and `portfolio_usd` are optional
+    query params that override the saved default for this one call without
+    changing it (use POST /api/recommendations/portfolio to actually change
+    the saved default)."""
+    from app import recommend
+
+    horizon = int(request.query_params.get("horizon", RECO_DEFAULT_HORIZON_DAYS))
+    if horizon not in engine.horizons():
+        return JSONResponse({"error": f"no model for horizon={horizon}", "available": engine.horizons()}, status_code=400)
+    portfolio_usd = request.query_params.get("portfolio_usd")
+    try:
+        portfolio_usd = float(portfolio_usd) if portfolio_usd is not None else None
+    except ValueError:
+        return JSONResponse({"error": "portfolio_usd must be a number"}, status_code=400)
+    if portfolio_usd is not None and portfolio_usd <= 0:
+        return JSONResponse({"error": "portfolio_usd must be positive"}, status_code=400)
+    try:
+        return JSONResponse(recommend.top_picks(horizon=horizon, portfolio_usd=portfolio_usd))
+    except Exception as e:
+        log.exception("recommendations failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def recommendations_portfolio_get(request):
+    from app import recommend
+
+    return JSONResponse({"portfolio_usd": recommend.portfolio_size()})
+
+
+def recommendations_portfolio_save(request):
+    from app import recommend
+
+    body = request.json()
+    try:
+        usd = float(body.get("portfolio_usd"))
+        recommend.set_portfolio_size(usd)
+    except (TypeError, ValueError) as e:
+        return JSONResponse({"error": f"invalid portfolio_usd: {e}"}, status_code=400)
+    return JSONResponse({"portfolio_usd": recommend.portfolio_size()})
+
+
 def trading_status(request):
     """Paper-trading visibility: whether it's turned on, the last pass's
     result, and a log of every decision (opened/closed/skipped, and why)
@@ -423,6 +467,9 @@ def build_router() -> Router:
     router.add("/api/forecast/{ticker}", forecast_detail)
     router.add("/api/prices/{ticker}", prices)
     router.add("/api/scorecard", scorecard_view)
+    router.add("/api/recommendations", recommendations)
+    router.add("/api/recommendations/portfolio", recommendations_portfolio_get)
+    router.add("/api/recommendations/portfolio", recommendations_portfolio_save, methods=["POST"])
     router.add("/api/refresh", refresh, methods=["POST"])
     router.add("/api/trading/status", trading_status)
     router.add("/api/auth/signup", signup, methods=["POST"])

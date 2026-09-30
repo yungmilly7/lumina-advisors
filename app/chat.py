@@ -20,7 +20,7 @@ import logging
 import urllib.error
 import urllib.request
 
-from app import db, scoring
+from app import db, recommend, scoring
 from app.config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL
 from app.engine import engine
 from app.universe import COMPANY_BY_TICKER, neighbors
@@ -35,10 +35,16 @@ stock prices; if the snapshot doesn't contain what's needed to answer, say so pl
 guessing or using what you otherwise know.
 
 Style: concise (2-5 sentences unless the question genuinely needs a short list), plain English, no \
-hedging filler. Never give direct buy/sell/hold investment advice or tell the person what to do \
-with their money -- explain what the model and data show instead. If the question drifts toward \
-"should I buy/sell", redirect to explaining the data and note forecasts here are probabilistic \
-estimates from a transparent statistical model, not guarantees. This is not investment advice."""
+hedging filler. Never give direct buy/sell/hold investment advice IN YOUR OWN VOICE or tell the \
+person what to do with their money -- explain what the model and data show instead. When someone \
+asks what to buy or invest in, you may cite the TOP MODEL PICKS section of the snapshot (it's the \
+same ranked, sized shortlist as the site's "What to Invest In" tab) -- describe it as the model's \
+current output, with its conviction score, track record, and rationale, not as your own \
+recommendation. If the question drifts toward "should I buy/sell" some ticker, answer with what \
+the data shows for it (or say it isn't a strong current signal if it doesn't appear in the picks) \
+and note forecasts here are probabilistic estimates from a transparent statistical model with \
+accuracy currently near a coin flip (see the scorecard), not guarantees. This is not investment \
+advice, and you are not a licensed financial advisor."""
 
 MAX_HISTORY_MESSAGES = 12  # ~6 user/assistant turns of prior context
 
@@ -133,10 +139,38 @@ def _market_snapshot(horizon: int) -> str:
     wf_hit = wf_overall.get("hit_rate")
     wf_folds = wf_overall.get("n_folds") or 0
 
+    def pick_line(p):
+        alloc = (
+            f", suggested ${p['allocation_usd']:,.0f} ({_fmt_pct(p['allocation_pct_of_portfolio'], 1)} of portfolio)"
+            if p.get("allocation_usd") is not None else ""
+        )
+        tr = p.get("track_record")
+        tr_str = f", track record {_fmt_pct(tr['hit_rate'], 0)} over {tr['n']} calls" if tr else ", no track record yet"
+        return (
+            f"  - {p['ticker']} ({p['name']}): {p['action'].upper()}, {_fmt_pct(p['expected_move_pct'])} expected, "
+            f"confidence={_fmt_pct(p['confidence'], 1)} ({p['signal_strength']}){tr_str}{alloc} -- {p['rationale']}"
+        )
+
+    try:
+        reco = recommend.top_picks(horizon=horizon)
+        top_buys = reco["buys"][:5]
+        top_shorts = reco["shorts"][:3]
+        picks_block = f"""TOP MODEL PICKS (ranked + sized by app.recommend -- same list as the site's "What to Invest In" \
+tab; hypothetical portfolio ${reco['portfolio_usd']:,.0f}, {_fmt_pct(1 - reco['cash_reserve_usd'] / reco['portfolio_usd'], 0)} \
+of it investable):
+{chr(10).join(pick_line(p) for p in top_buys) or "  (no buy candidates clear the current data)"}
+{"OTHER NOTABLE SHORT IDEAS (model expects these down; not sized -- shorting needs a margin account):" if top_shorts else ""}
+{chr(10).join(pick_line(p) for p in top_shorts)}
+"""
+    except Exception:
+        log.exception("failed to build top-picks block for chat snapshot")
+        picks_block = ""
+
     return f"""WHOLE-MARKET SNAPSHOT ({horizon}-trading-day horizon, {n} companies tracked):
   breadth: {up} called UP / {n - up} called DOWN ({_fmt_pct(up / n, 0)} up)
   average confidence: {_fmt_pct(avg_conf, 1)}, average |expected move|: {_fmt_pct(avg_move)}
 {_macro_regime_line()}
+{picks_block}
 TOP GAINERS (by model expected move):
 {chr(10).join(line(f) for f in gainers)}
 TOP DECLINERS (by model expected move):

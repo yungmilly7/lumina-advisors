@@ -416,6 +416,69 @@ off on a background thread once `ready=True`, so the very first request
 (and every 4-hourly scheduled refresh) is never blocked on it; the
 walk-forward numbers just fill in a few/several seconds later.
 
+## What to invest in (ranked, sized picks)
+
+The "What to Invest In" tab (and `/api/recommendations`) turns the day's
+448-row forecast table into a short, ranked, sized shortlist -- what to
+look at, when, why, and (for buys) how much of a hypothetical portfolio to
+put into it. It's implemented in `app/recommend.py` and is **not** a new
+signal: every field on a pick traces back to a forecast row `app.forecast`
+already produced and a ticker's own backtested track record `app.scoring`
+already logged. This module only filters, ranks, and sizes what's already
+on the site.
+
+**Ranking ("what" and "when").** Each ticker's forecast confidence is
+blended with that *same* ticker's own historical hit rate
+(`db.scorecard_by_ticker`) into a conviction score -- a confident call
+today on a ticker this model has historically been coin-flip-or-worse on
+gets discounted, not taken at face value. Small sample sizes are
+Bayesian-shrunk toward 50% first, so a ticker's lucky or unlucky handful of
+outcomes can't swing its score wildly. "When" is just the forecast
+horizon already in use elsewhere on the site (5/10/20 trading days, etc.).
+Expected-move size is deliberately *not* part of the ranking (mixing "how
+sure" with "how big" would blur what the rank means) -- it's shown per
+pick instead, alongside the target price, so you can weigh reward size
+yourself. There's also deliberately no hard confidence/move floor that
+could silently return zero picks; every pick is labeled `signal_strength`
+(weak/moderate/strong), calibrated against this model's own observed
+confidence range, so a weak field of candidates reads as weak rather than
+as "no picks".
+
+**Sizing ("how much").** A configured hypothetical portfolio size (set via
+the tab's input, or `POST /api/recommendations/portfolio` -- a planning
+number stored in the `meta` table, not a real account) is split across the
+top buy picks proportional to conviction score, capped per position at
+`RECO_MAX_POSITION_PCT` (25% by default) of the investable amount so no
+single ticker can dominate regardless of score, with any capped overflow
+iteratively redistributed across the remaining picks. `RECO_CASH_RESERVE_PCT`
+(10% by default) of the portfolio is always held back as cash, never
+allocated. "Short" candidates (the model expects the price to fall) are
+ranked and shown with the same rationale/confidence/track-record detail as
+buys, but are **never** sized in dollars -- shorting needs a margin/
+short-selling account this module has no way to confirm you have.
+
+**Recommend-only, by design.** This module never places an order --
+separate from, and with no connection to, the opt-in paper-trading bot
+above. It only surfaces ranked ideas and suggested sizing for a human to
+read and decide on.
+
+**Three ways to see it,** all reading from the same engine:
+1. The **"What to Invest In" tab** on the site.
+2. **Ask the chat assistant** ("what should I buy?", "what looks good this
+   week?") -- the assistant is told it may cite the picks as the model's
+   current output (with the same rationale/confidence/track-record detail
+   shown on the tab), never phrased as its own personal advice, consistent
+   with the rest of the site's "not a licensed financial advisor" framing.
+3. `GET /api/recommendations` directly (optional `horizon`/`portfolio_usd`
+   query params override the saved default for that one call without
+   changing it).
+
+All the knobs (`STOCKGRAPH_RECO_MAX_PICKS`, `STOCKGRAPH_RECO_DEFAULT_HORIZON`,
+`STOCKGRAPH_RECO_MAX_POSITION_PCT`, `STOCKGRAPH_RECO_CASH_RESERVE_PCT`,
+`STOCKGRAPH_RECO_MIN_CONFIDENCE`, `STOCKGRAPH_RECO_MIN_MOVE_PCT`,
+`STOCKGRAPH_RECO_DEFAULT_PORTFOLIO_USD`) are environment variables -- see
+`app/config.py` and `.env.example`.
+
 ## Honest limitations
 
 - The forecasting model is intentionally simple and transparent (linear

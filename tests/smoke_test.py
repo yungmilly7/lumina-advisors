@@ -1010,6 +1010,163 @@ class TestChat(unittest.TestCase):
         self.assertIn("FORECAST", snapshot)
 
 
+class TestRecommend(unittest.TestCase):
+    """app.recommend -- the "what to invest in, when, why, how, how much"
+    ranking/sizing engine -- plus its /api/recommendations* routes and its
+    chat-snapshot integration. See app/recommend.py's module docstring for
+    the ranking (conviction score) and sizing (capped water-filling)
+    methodology this exercises."""
+
+    @classmethod
+    def setUpClass(cls):
+        from app.api import router
+        from app.engine import engine
+
+        if not engine.ready:
+            engine.bootstrap()
+        cls.client = _InProcessClient(router)
+
+    def setUp(self):
+        # Each test gets a clean saved-portfolio-size slate, independent of
+        # whatever an earlier test in this class (or another class sharing
+        # the same throwaway DB) left in the meta table.
+        from app import db
+
+        db.set_meta("reco_portfolio_usd", None)
+
+    def test_top_picks_returns_well_formed_buys_and_shorts(self):
+        from app import recommend
+
+        result = recommend.top_picks(horizon=5)
+        for key in (
+            "generated_at", "horizon_days", "portfolio_usd", "cash_reserve_usd",
+            "investable_usd", "buys", "shorts", "method_note",
+        ):
+            self.assertIn(key, result)
+        self.assertEqual(result["horizon_days"], 5)
+        self.assertGreater(len(result["buys"]) + len(result["shorts"]), 0)
+
+        for p in result["buys"] + result["shorts"]:
+            self.assertIn(p["action"], ("buy", "short"))
+            self.assertIn(p["signal_strength"], ("weak", "moderate", "strong"))
+            self.assertIn("rationale", p)
+            self.assertIn("conviction_score", p)
+            self.assertGreaterEqual(p["confidence"], 0.0)
+
+        for p in result["buys"]:
+            self.assertEqual(p["action"], "buy")
+            self.assertIsNotNone(p["allocation_usd"])
+            self.assertGreaterEqual(p["allocation_usd"], 0.0)
+
+        # Shorts are ranked/shown but deliberately never sized in dollars --
+        # see the module docstring on why (no way to confirm a margin
+        # account exists).
+        for p in result["shorts"]:
+            self.assertEqual(p["action"], "short")
+            self.assertIsNone(p["allocation_usd"])
+            self.assertIsNone(p["allocation_pct_of_portfolio"])
+            self.assertIsNone(p["suggested_shares"])
+
+    def test_buy_allocations_sum_to_investable_amount_and_respect_cap(self):
+        from app import config, recommend
+
+        result = recommend.top_picks(horizon=5, portfolio_usd=10000)
+        self.assertAlmostEqual(
+            sum(p["allocation_usd"] for p in result["buys"]),
+            result["investable_usd"],
+            delta=0.05,
+        )
+        cap = config.RECO_MAX_POSITION_PCT * result["investable_usd"]
+        for p in result["buys"]:
+            # A one-cent rounding slack accounts for round(usd, 2) on each
+            # position; the cap itself only relaxes when a single position
+            # is left with nowhere else for the money to go.
+            self.assertLessEqual(p["allocation_usd"], cap + 0.01)
+
+    def test_cash_reserve_is_held_back_and_never_allocated(self):
+        from app import config, recommend
+
+        result = recommend.top_picks(horizon=5, portfolio_usd=10000)
+        self.assertAlmostEqual(result["cash_reserve_usd"], 10000 * config.RECO_CASH_RESERVE_PCT, places=2)
+        self.assertAlmostEqual(result["investable_usd"] + result["cash_reserve_usd"], 10000.0, places=2)
+
+    def test_unknown_horizon_raises(self):
+        from app import recommend
+
+        with self.assertRaises(ValueError):
+            recommend.top_picks(horizon=9999)
+
+    def test_portfolio_size_round_trips_through_meta_table(self):
+        from app import recommend
+
+        recommend.set_portfolio_size(25000.0)
+        self.assertEqual(recommend.portfolio_size(), 25000.0)
+
+    def test_portfolio_size_defaults_when_unset(self):
+        from app import config, recommend
+
+        self.assertEqual(recommend.portfolio_size(), config.RECO_DEFAULT_PORTFOLIO_USD)
+
+    def test_set_portfolio_size_rejects_non_positive_and_nan(self):
+        from app import recommend
+
+        for bad in (0, -100, float("nan")):
+            with self.assertRaises(ValueError):
+                recommend.set_portfolio_size(bad)
+
+    def test_get_recommendations_endpoint(self):
+        r = self.client.get("/api/recommendations?horizon=5")
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertEqual(data["horizon_days"], 5)
+        self.assertIn("buys", data)
+        self.assertIn("shorts", data)
+
+    def test_get_recommendations_rejects_unknown_horizon(self):
+        r = self.client.get("/api/recommendations?horizon=9999")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("available", r.json())
+
+    def test_get_recommendations_rejects_bad_portfolio_usd(self):
+        r = self.client.get("/api/recommendations?horizon=5&portfolio_usd=notanumber")
+        self.assertEqual(r.status_code, 400)
+        r2 = self.client.get("/api/recommendations?horizon=5&portfolio_usd=-500")
+        self.assertEqual(r2.status_code, 400)
+
+    def test_get_recommendations_honors_one_off_portfolio_override(self):
+        r = self.client.get("/api/recommendations?horizon=5&portfolio_usd=50000")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["portfolio_usd"], 50000.0)
+        # A one-off override in the query string must not persist as the
+        # saved default for later calls that don't pass it.
+        r2 = self.client.get("/api/recommendations/portfolio")
+        self.assertNotEqual(r2.json()["portfolio_usd"], 50000.0)
+
+    def test_portfolio_get_and_save_round_trip(self):
+        r = self.client.get("/api/recommendations/portfolio")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("portfolio_usd", r.json())
+
+        r2 = self.client.post("/api/recommendations/portfolio", {"portfolio_usd": 15000})
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r2.json()["portfolio_usd"], 15000.0)
+
+        r3 = self.client.get("/api/recommendations/portfolio")
+        self.assertEqual(r3.json()["portfolio_usd"], 15000.0)
+
+    def test_portfolio_save_rejects_invalid_values(self):
+        r = self.client.post("/api/recommendations/portfolio", {"portfolio_usd": "not-a-number"})
+        self.assertEqual(r.status_code, 400)
+        r2 = self.client.post("/api/recommendations/portfolio", {"portfolio_usd": -1})
+        self.assertEqual(r2.status_code, 400)
+
+    def test_chat_snapshot_includes_top_model_picks_section(self):
+        from app import chat as chat_module
+
+        snapshot = chat_module.build_snapshot(None, 5)
+        self.assertIn("TOP MODEL PICKS", snapshot)
+
+
 class TestLoginRateLimiter(unittest.TestCase):
     """Regression/coverage test for the brute-force guard added to
     auth.login(): repeated wrong passwords for one email should eventually

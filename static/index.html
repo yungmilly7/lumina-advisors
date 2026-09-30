@@ -41,6 +41,7 @@
 
 <nav class="tabs">
   <button class="tab-btn active" data-tab="graph">Relationship Graph</button>
+  <button class="tab-btn" data-tab="recommendations">What to Invest In</button>
   <button class="tab-btn" data-tab="forecasts">All Forecasts</button>
   <button class="tab-btn" data-tab="compare">Compare</button>
   <button class="tab-btn" data-tab="watchlist">Watchlist<span id="watchlistCount" class="tab-count hidden">0</span></button>
@@ -94,6 +95,36 @@
       <aside id="detailPanel" class="detail-panel">
         <div class="detail-empty">Click any company in the graph, or search below, to see its forecast.</div>
       </aside>
+    </div>
+  </section>
+
+  <section id="tab-recommendations" class="tab-panel">
+    <div class="panel-head">
+      <h2>What to invest in</h2>
+      <p class="hint">A ranked, sized shortlist pulled from the same forecasts on the other tabs — not a new signal, just this model's best current ideas, discounted by each ticker's own backtested track record. <strong>This is model output on a statistical model with accuracy near a coin flip (see the Scorecard tab) — not personalized financial advice, and not a recommendation from a licensed advisor.</strong></p>
+    </div>
+    <div class="reco-controls">
+      <label class="reco-portfolio-input">
+        Hypothetical portfolio
+        <span class="reco-dollar-wrap">
+          $<input id="recoPortfolioInput" type="number" min="1" step="100" />
+        </span>
+      </label>
+      <button id="recoApplyBtn" class="btn btn-ghost">Apply &amp; re-rank</button>
+      <span id="recoAllocSummary" class="hint reco-alloc-summary"></span>
+    </div>
+    <p id="recoMethodNote" class="hint reco-method-note"></p>
+    <div id="recoBuysEmpty" class="empty-state hidden">
+      <div class="empty-state-icon">—</div>
+      <p>No buy candidates clear the current horizon's data yet.</p>
+    </div>
+    <div id="recoBuysWrap">
+      <h3>Buy ideas <span class="hint">— sized against the portfolio above</span></h3>
+      <div id="recoBuysGrid" class="reco-grid"></div>
+    </div>
+    <div id="recoShortsWrap">
+      <h3>Short ideas <span class="hint">— model expects these down; shown for awareness, not sized (shorting needs a margin account)</span></h3>
+      <div id="recoShortsGrid" class="reco-grid"></div>
     </div>
   </section>
 

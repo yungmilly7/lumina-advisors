@@ -691,6 +691,31 @@ main { padding: 18px 20px 40px; max-width: 1500px; margin: 0 auto; }
 
 .section-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-muted); margin: 18px 0 8px; }
 
+.reco-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+.reco-portfolio-input { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; }
+.reco-dollar-wrap { display: flex; align-items: center; gap: 4px; font-size: 15px; font-weight: 700; color: var(--text); text-transform: none; }
+.reco-dollar-wrap input { width: 120px; font: inherit; font-weight: 700; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--panel-border); background: var(--bg); color: var(--text); }
+.reco-alloc-summary { max-width: none; }
+.reco-method-note { margin-bottom: 16px; font-style: italic; }
+#recoBuysWrap h3, #recoShortsWrap h3 { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: 15px; margin: 18px 0 10px; }
+#recoShortsWrap { margin-top: 8px; }
+
+.reco-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.reco-card { background: var(--panel); border: 1px solid var(--panel-border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
+.reco-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.reco-card-title { font-weight: 700; font-size: 14.5px; }
+.reco-card-sub { font-size: 12px; color: var(--text-muted); margin-top: -4px; }
+.reco-badges { display: flex; gap: 6px; flex-wrap: wrap; }
+.strength-badge { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; padding: 3px 8px; border-radius: 999px; }
+.strength-strong { background: var(--up-soft); color: var(--up); }
+.strength-moderate { background: var(--accent-soft); color: var(--accent); }
+.strength-weak { background: var(--panel-border); color: var(--text-muted); }
+.reco-alloc-box { background: var(--bg); border: 1px solid var(--panel-border); border-radius: 8px; padding: 8px 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.reco-alloc-box .value { font-size: 16px; font-weight: 800; }
+.reco-alloc-box .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; }
+.reco-rationale { font-size: 12.5px; color: var(--text-muted); line-height: 1.45; margin: 0; }
+.reco-earnings-flag { font-size: 11.5px; color: var(--down); font-weight: 600; }
+
 .sparkline-wrap { margin-bottom: 4px; }
 
 .rationale-box { font-size: 13.5px; line-height: 1.5; background: var(--bg); border-left: 3px solid var(--accent); padding: 10px 12px; border-radius: 6px; }

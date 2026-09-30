@@ -39,6 +39,7 @@ const state = {
   sectors: [],
   health: null,
   compare: [null, null],
+  recommendations: null,
 };
 
 const DRIVER_GLOSSARY = {
@@ -369,8 +370,12 @@ function wireStaticUI() {
     renderCompareContent();
     buildNetwork();
     if (state.selectedTicker) selectTicker(state.selectedTicker);
+    if (document.getElementById("tab-recommendations").classList.contains("active")) {
+      await loadRecommendations();
+    }
   });
   document.getElementById("refreshBtn").addEventListener("click", onRefresh);
+  document.getElementById("recoApplyBtn").addEventListener("click", onRecoApply);
   document.getElementById("themeToggleBtn").addEventListener("click", toggleTheme);
   document.getElementById("forecastSearch").addEventListener("input", () => renderForecastTable());
   document.getElementById("exportCsvBtn").addEventListener("click", exportForecastsCSV);
@@ -408,6 +413,7 @@ function switchTab(tab) {
   document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   document.querySelectorAll(".tab-panel").forEach((p) => p.classList.toggle("active", p.id === `tab-${tab}`));
   if (tab === "graph" && state.network) setTimeout(() => state.network._resize(), 50);
+  if (tab === "recommendations" && !state.recommendations) loadRecommendations();
   if (tab === "watchlist") renderWatchlistTab();
   if (tab === "forecasts") setTimeout(renderSectorPerfChart, 30);
   if (tab === "compare") setTimeout(renderCompareContent, 30);
@@ -533,6 +539,110 @@ async function loadForecasts() {
   const list = await fetchJSON(`/api/forecasts?horizon=${state.horizon}`);
   state.forecasts = list;
   state.forecastByTicker = Object.fromEntries(list.map((f) => [f.ticker, f]));
+}
+
+// "What to Invest In" tab -- see app/recommend.py for the ranking/sizing
+// methodology this just renders. Loaded lazily (on first visit to the tab,
+// or a horizon change while it's the active tab) rather than in loadAll(),
+// since it's not needed for any other tab and depends on the portfolio
+// size input below, which itself comes back from the same call.
+async function loadRecommendations() {
+  const reco = await fetchJSON(`/api/recommendations?horizon=${state.horizon}`);
+  state.recommendations = reco;
+  const input = document.getElementById("recoPortfolioInput");
+  if (input && document.activeElement !== input) input.value = reco.portfolio_usd;
+  renderRecommendations();
+}
+
+function recoCardHTML(p, sized) {
+  const dirClass = p.action === "buy" ? "call-up" : "call-down";
+  const badgeLabel = p.action === "buy" ? "BUY" : "SHORT";
+  const earningsFlag =
+    p.days_to_earnings !== null && p.days_to_earnings !== undefined && p.days_to_earnings <= p.horizon_days
+      ? `<div class="reco-earnings-flag">⚠ Earnings in ${p.days_to_earnings}d — inside this ${p.horizon_days}-day window, expect extra volatility</div>`
+      : "";
+  const allocHTML = sized
+    ? `<div class="reco-alloc-box">
+         <div><div class="label">Suggested allocation</div><div class="value">$${p.allocation_usd.toLocaleString()} <span class="hint" style="display:inline;">(${fmtPct(p.allocation_pct_of_portfolio, 1)} · ~${p.suggested_shares} sh)</span></div></div>
+       </div>`
+    : "";
+  return `
+    <div class="reco-card" data-ticker="${p.ticker}">
+      <div class="reco-card-head">
+        <div>
+          <div class="reco-card-title">${p.ticker} <span style="font-weight:500;color:var(--text-muted);">${escapeHtml(p.name)}</span></div>
+          <div class="reco-card-sub">${escapeHtml(p.sector || "")} · next ${p.horizon_days} trading days</div>
+        </div>
+        <span class="call-badge ${dirClass}" style="font-size:12.5px;padding:4px 9px;">${badgeLabel}</span>
+      </div>
+      <div class="reco-badges">
+        <span class="strength-badge strength-${p.signal_strength}">${p.signal_strength} signal</span>
+        <span class="hint" style="max-width:none;">confidence ${fmtPct(p.confidence, 1)}</span>
+      </div>
+      <div class="metric-grid">
+        <div class="metric-box"><div class="label">Price</div><div class="value">${fmtPrice(p.base_price)}</div></div>
+        <div class="metric-box"><div class="label">Target</div><div class="value">${fmtPrice(p.target_price)}</div></div>
+        <div class="metric-box"><div class="label">Expected move</div><div class="value ${p.expected_move_pct >= 0 ? "dir-up" : "dir-down"}">${fmtSignedPct(p.expected_move_pct)}</div></div>
+      </div>
+      ${allocHTML}
+      ${earningsFlag}
+      ${trackRecordHTML(p.track_record)}
+      <p class="reco-rationale">${escapeHtml(p.rationale)}</p>
+    </div>`;
+}
+
+function renderRecommendations() {
+  const reco = state.recommendations;
+  if (!reco) return;
+  const summaryEl = document.getElementById("recoAllocSummary");
+  if (summaryEl) {
+    summaryEl.textContent =
+      `Investing $${reco.investable_usd.toLocaleString()} across picks, ` +
+      `holding $${reco.cash_reserve_usd.toLocaleString()} in cash.`;
+  }
+  const noteEl = document.getElementById("recoMethodNote");
+  if (noteEl) noteEl.textContent = reco.method_note;
+
+  const buysEmpty = document.getElementById("recoBuysEmpty");
+  const buysWrap = document.getElementById("recoBuysWrap");
+  const buysGrid = document.getElementById("recoBuysGrid");
+  if (reco.buys.length) {
+    buysEmpty.classList.add("hidden");
+    buysWrap.classList.remove("hidden");
+    buysGrid.innerHTML = reco.buys.map((p) => recoCardHTML(p, true)).join("");
+  } else {
+    buysEmpty.classList.remove("hidden");
+    buysWrap.classList.add("hidden");
+  }
+
+  const shortsWrap = document.getElementById("recoShortsWrap");
+  const shortsGrid = document.getElementById("recoShortsGrid");
+  if (reco.shorts.length) {
+    shortsWrap.classList.remove("hidden");
+    shortsGrid.innerHTML = reco.shorts.map((p) => recoCardHTML(p, false)).join("");
+  } else {
+    shortsWrap.classList.add("hidden");
+  }
+}
+
+async function onRecoApply() {
+  const input = document.getElementById("recoPortfolioInput");
+  const usd = Number(input.value);
+  if (!usd || usd <= 0) {
+    toast("Enter a positive portfolio size.", "error");
+    return;
+  }
+  const btn = document.getElementById("recoApplyBtn");
+  btn.disabled = true;
+  try {
+    await postJSON("/api/recommendations/portfolio", { portfolio_usd: usd });
+    await loadRecommendations();
+    toast("Re-ranked against the new portfolio size.", "success");
+  } catch (e) {
+    toast(`Couldn't save that: ${e.message}`, "error");
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function renderModeBadge(status) {
