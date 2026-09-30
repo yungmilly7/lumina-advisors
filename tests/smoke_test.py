@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -171,6 +172,23 @@ class TestJSONResponse(unittest.TestCase):
         self.assertIsNone(parsed["b"])
         self.assertIsNone(parsed["c"][1])
         self.assertEqual(parsed["d"], 3.5)
+
+
+class TestStaticFileCaching(unittest.TestCase):
+    """Regression test: _serve_static() re-reads static/* fresh from disk on
+    every request specifically so an edit shows up on next page load with
+    no server restart needed -- but FileResponse used to send no caching
+    headers at all, and a browser applies its OWN heuristic caching to any
+    response like that, so a browser that already loaded /app.js once could
+    go on serving that stale cached copy indefinitely even on an ordinary
+    reload, silently masking every update after the first. Every static
+    file must tell the browser not to do that."""
+
+    def test_file_response_sends_no_cache_header(self):
+        from app.httpserver import FileResponse
+
+        r = FileResponse(Path(__file__))  # any real file on disk works here
+        self.assertEqual(getattr(r, "extra_headers", {}).get("Cache-Control"), "no-cache")
 
 
 class TestSecEdgarFilings(unittest.TestCase):

@@ -121,6 +121,19 @@ class FileResponse(_CookieMixin):
         ctype = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
         self.content_type = ctype
         self._cookies = []
+        # _serve_static() re-reads every file from disk on every request
+        # specifically so an edit takes effect on the next load with no
+        # server restart -- but browsers apply their own *heuristic* caching
+        # to any response with no explicit caching headers at all (which is
+        # what this class sent before), so without this, a browser that's
+        # already loaded /app.js or /index.html once can keep serving that
+        # cached copy for a while even on a plain reload, silently masking
+        # updates (and, worse, running mismatched HTML/JS together). "no-
+        # cache" (not "no-store") still lets the browser keep a local copy,
+        # it just forces a revalidation request every time -- effectively
+        # free here since the server has no ETag/Last-Modified to check
+        # against anyway, so every request gets the current file.
+        self.extra_headers = {"Cache-Control": "no-cache"}
 
 
 class PlainResponse(_CookieMixin):
@@ -231,6 +244,8 @@ def make_app(router: Router):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "*")
             self.send_header("Access-Control-Allow-Headers", "*")
+            for header_name, header_value in getattr(resp, "extra_headers", {}).items():
+                self.send_header(header_name, header_value)
             for cookie in getattr(resp, "_cookies", []):
                 self.send_header("Set-Cookie", cookie)
             self.end_headers()
