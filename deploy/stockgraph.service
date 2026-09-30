@@ -1,0 +1,33 @@
+[Unit]
+Description=Lumina Advisors
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Adjust these three paths/user if you didn't follow deploy/DEPLOY.md exactly.
+User=stockgraph
+WorkingDirectory=/opt/stockgraph
+ExecStart=/opt/stockgraph/.venv/bin/python /opt/stockgraph/run.py
+Restart=on-failure
+RestartSec=5
+
+# First boot runs the whole ingest->train->backtest pipeline synchronously
+# (a few minutes in live mode) before the process starts listening, so give
+# systemd plenty of room before it decides the start failed.
+TimeoutStartSec=600
+
+# Bind only to localhost -- Caddy (see deploy/Caddyfile) is the public-facing
+# reverse proxy and terminates TLS. The app itself never needs to be
+# reachable directly from the internet.
+Environment=STOCKGRAPH_HOST=127.0.0.1
+Environment=STOCKGRAPH_PORT=8000
+
+# Basic OS-level hardening -- the app doesn't need anything beyond its own
+# working directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/stockgraph/data
+
+[Install]
+WantedBy=multi-user.target

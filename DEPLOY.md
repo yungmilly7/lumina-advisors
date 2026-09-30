@@ -104,3 +104,10 @@ tend to ask for a card, even if usage stays inside a free allowance). The
 one thing to keep straight if you switch: `python run.py` is the start
 command, and it reads the assigned port from a `PORT` environment
 variable, which Render/Railway/Fly.io all set automatically.
+
+**Want your own server instead** -- a real domain, no cold-start sleep, and
+a database that survives redeploys, at the cost of more setup and usually a
+few dollars a month? See `deploy/DEPLOY.md` for a fully prepared systemd +
+Caddy (free auto-HTTPS) setup for a plain Ubuntu VPS (Oracle's free tier,
+DigitalOcean, or Hetzner all work) -- just SSH in and run
+`deploy/setup.sh`.

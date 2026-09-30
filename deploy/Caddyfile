@@ -1,0 +1,32 @@
+# Caddy config for Lumina Advisors.
+#
+# Caddy gets you free, auto-renewing HTTPS (Let's Encrypt) with zero
+# certificate management -- replace the placeholder domain below with your
+# real one, point its DNS A record at your server's IP, then:
+#
+#   sudo caddy fmt --overwrite /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# and Caddy handles the certificate automatically on first request.
+
+your-domain.com {
+	reverse_proxy 127.0.0.1:8000
+
+	# Modest security headers -- cheap to add, no reason not to.
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options SAMEORIGIN
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+
+	encode gzip
+}
+
+# If you don't have a domain yet, comment out the block above and use this
+# instead to serve plain HTTP on the server's bare IP (fine for early
+# testing with a few people, not for a real launch -- passwords would cross
+# the network in the clear):
+#
+# :80 {
+# 	reverse_proxy 127.0.0.1:8000
+# }
