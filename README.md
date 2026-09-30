@@ -234,6 +234,48 @@ are random opaque tokens in an HttpOnly cookie, not a client-readable JWT.
 Signing in is entirely optional -- forecasts, the graph, and the scorecard
 all work the same either way.
 
+## Paper trading (optional, off by default)
+
+Lumina can turn its own top-confidence forecasts into simulated orders on
+a free [Alpaca](https://alpaca.markets) paper-trading account -- the real
+brokerage API, but every order fills against fake money in a simulated
+account. Nothing here can place a real trade: `ALPACA_BASE_URL` defaults
+to Alpaca's paper host, and this project has never been pointed at the
+live one.
+
+**It's off until you turn it on, on purpose, in two places:**
+
+1. Sign up free at [alpaca.markets](https://alpaca.markets) -> Paper
+   Trading tab -> "Generate New Keys" (no funding or approval needed --
+   it's simulated). Put the two keys in `.env` as `ALPACA_API_KEY` /
+   `ALPACA_SECRET_KEY`.
+2. Set `STOCKGRAPH_TRADING_ENABLED=true` in `.env`.
+
+With both set, every bootstrap/scheduled refresh runs one more step after
+generating forecasts: it closes whatever positions the bot is currently
+holding (each forecast is a fresh "as of right now" call, so yesterday's
+position isn't a thesis worth holding through today), then opens new
+positions from today's highest-confidence calls on the shortest trained
+horizon, up to a fixed number of positions, each a fixed dollar size. A
+kill switch checks the paper account's own day-over-day P&L before opening
+anything and skips the whole pass if it's already past a configurable loss
+threshold. Every decision -- opened, closed, or skipped, and exactly why
+-- is logged to the `paper_trades` table and readable at
+`/api/trading/status`. All the knobs (which horizon, confidence floor,
+position count/size, kill-switch threshold) are environment variables --
+see `.env.example`.
+
+**Read this before turning it on:** the "Honest limitations" section right
+below says the model's holdout accuracy is roughly coin-flip. That's fine
+for a forecast you read and think about; it's a real reason not to expect
+this to make (paper) money as shipped. This exists so you can *watch* that
+play out safely with fake money, not because the strategy is validated.
+
+This is deliberately **not** wired into `render.yaml` / the public Render
+deployment -- it's meant to stay a local, opt-in experiment against your
+own paper account on your own machine, not something every visitor to the
+public demo shares or can affect.
+
 ## Honest limitations
 
 - The forecasting model is intentionally simple and transparent (linear

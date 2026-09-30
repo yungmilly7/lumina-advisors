@@ -13,7 +13,7 @@ import logging
 import os
 import threading
 
-from app import db, pipeline, scoring
+from app import db, pipeline, scoring, trading
 from app.forecast import ForecastModels, generate_all_forecasts, generate_forecast, train_models
 from app.signals import FeaturePanel, build_feature_panel
 
@@ -41,6 +41,7 @@ class Engine:
         self._stop_refresh = threading.Event()
         self.refresh_interval_hours: float = 0.0
         self.last_refresh_error: str | None = None
+        self.last_trading_result: dict = {}
 
     def bootstrap(self) -> None:
         with self.lock:
@@ -57,6 +58,19 @@ class Engine:
             self._regenerate_forecasts()
             self.ready = True
             log.info("bootstrap complete.")
+            # Off unless Danny has both set STOCKGRAPH_TRADING_ENABLED and
+            # pasted his own Alpaca paper-trading keys in -- see
+            # app/trading.py. A failure here is logged and recorded, never
+            # allowed to undo the bootstrap that already succeeded above
+            # (the site should keep serving forecasts even if the paper-
+            # trading pass itself breaks).
+            if trading.enabled():
+                log.info("bootstrap: running paper-trading pass...")
+                try:
+                    self.last_trading_result = trading.run_trading_pass(self)
+                except Exception as e:
+                    log.exception("paper-trading pass failed; forecasts/site are unaffected")
+                    self.last_trading_result = {"ran": False, "reason": f"unexpected error: {e}"}
 
     def start_background_refresh(self, interval_hours: float = REFRESH_INTERVAL_HOURS) -> None:
         """Periodically re-runs the full bootstrap (ingest -> features ->
@@ -150,6 +164,8 @@ class Engine:
                 "backtest_summary": {str(k): v for k, v in self.backtest_summary.items()},
                 "refresh_interval_hours": self.refresh_interval_hours,
                 "last_refresh_error": self.last_refresh_error,
+                "trading_enabled": trading.enabled(),
+                "last_trading_result": self.last_trading_result,
             }
 
 

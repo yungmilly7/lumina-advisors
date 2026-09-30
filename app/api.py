@@ -234,6 +234,20 @@ def refresh(request):
     return JSONResponse(engine.status())
 
 
+def trading_status(request):
+    """Paper-trading visibility: whether it's turned on, the last pass's
+    result, and a log of every decision (opened/closed/skipped, and why)
+    -- matches this project's "explainable" ethos instead of a bot that
+    silently moves (paper) money with no record of its reasoning."""
+    from app import trading
+
+    return JSONResponse({
+        "enabled": trading.enabled(),
+        "last_result": engine.last_trading_result,
+        "recent_trades": [dict(r) for r in db.recent_paper_trades(limit=50)],
+    })
+
+
 # ---------- accounts ----------
 
 
@@ -400,6 +414,7 @@ def build_router() -> Router:
     router.add("/api/prices/{ticker}", prices)
     router.add("/api/scorecard", scorecard_view)
     router.add("/api/refresh", refresh, methods=["POST"])
+    router.add("/api/trading/status", trading_status)
     router.add("/api/auth/signup", signup, methods=["POST"])
     router.add("/api/auth/login", login, methods=["POST"])
     router.add("/api/auth/logout", logout, methods=["POST"])

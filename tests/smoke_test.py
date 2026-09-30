@@ -1221,5 +1221,99 @@ class TestHealthEndpointAndProvenanceExposure(unittest.TestCase):
                     self.assertIn(key, row["track_record"])
 
 
+class TestPaperTrading(unittest.TestCase):
+    """app.trading turns forecasts into simulated Alpaca orders. These
+    never touch the network -- app.broker's functions are mocked out --
+    so what's actually under test is the strategy/risk logic: the
+    off-by-default guard, the kill switch halting *before* any order is
+    placed, and the daily-rebalance (close-then-open, confidence-ranked,
+    floor-filtered) behavior."""
+
+    def test_disabled_by_default_without_env_or_keys(self):
+        from app import broker, trading
+
+        self.assertFalse(broker.is_configured())
+        self.assertFalse(trading.enabled())
+        result = trading.run_trading_pass(engine=None)
+        self.assertFalse(result["ran"])
+
+    def test_broker_unreachable_aborts_pass_cleanly(self):
+        from unittest import mock
+
+        from app import broker, trading
+
+        with mock.patch.object(trading, "TRADING_ENABLED", True), \
+             mock.patch.object(broker, "is_configured", return_value=True), \
+             mock.patch.object(broker, "get_account", side_effect=broker.BrokerError("boom")):
+            result = trading.run_trading_pass(engine=mock.Mock())
+
+        self.assertFalse(result["ran"])
+        self.assertIn("boom", result["reason"])
+
+    def test_kill_switch_halts_pass_before_any_order(self):
+        from unittest import mock
+
+        from app import broker, db, trading
+
+        with mock.patch.object(trading, "TRADING_ENABLED", True), \
+             mock.patch.object(broker, "is_configured", return_value=True), \
+             mock.patch.object(broker, "get_account", return_value={"equity": "9000", "last_equity": "10000"}), \
+             mock.patch.object(broker, "list_positions") as mock_list, \
+             mock.patch.object(broker, "submit_order") as mock_submit:
+            result = trading.run_trading_pass(engine=mock.Mock())
+
+        # -10% day breaches the default -3% kill-switch threshold.
+        self.assertTrue(result["ran"])
+        self.assertTrue(result["halted_by_kill_switch"])
+        mock_list.assert_not_called()
+        mock_submit.assert_not_called()
+
+        rows = db.recent_paper_trades(limit=1)
+        self.assertEqual(rows[0]["action"], "skipped")
+        self.assertIn("kill switch", rows[0]["reason"])
+
+    def test_daily_rebalance_closes_prior_positions_and_opens_top_confidence_ones(self):
+        from unittest import mock
+
+        from app import broker, trading
+
+        fake_engine = mock.Mock()
+        fake_engine.horizons.return_value = [1, 5, 20]
+        fake_engine.list_forecasts.return_value = [
+            {"ticker": "AAA", "confidence": 0.9, "direction": "up"},
+            {"ticker": "BBB", "confidence": 0.4, "direction": "down"},  # below the 0.6 floor
+            {"ticker": "CCC", "confidence": 0.7, "direction": "down"},
+        ]
+
+        with mock.patch.object(trading, "TRADING_ENABLED", True), \
+             mock.patch.object(broker, "is_configured", return_value=True), \
+             mock.patch.object(broker, "get_account", return_value={"equity": "10100", "last_equity": "10000"}), \
+             mock.patch.object(broker, "list_positions", return_value=[{"symbol": "ZZZ"}]), \
+             mock.patch.object(broker, "close_position", return_value={"id": "close-1"}) as mock_close, \
+             mock.patch.object(broker, "submit_order", return_value={"id": "order-1"}) as mock_submit:
+            result = trading.run_trading_pass(fake_engine)
+
+        self.assertTrue(result["ran"])
+        self.assertFalse(result["halted_by_kill_switch"])
+        mock_close.assert_called_once_with("ZZZ")
+
+        # Only the two forecasts at/above the 0.6 confidence floor trade;
+        # BBB (0.4) is filtered out even though there's room under the
+        # default 5-position cap.
+        self.assertEqual(mock_submit.call_count, 2)
+        sides_by_ticker = {c.args[0]: c.args[1] for c in mock_submit.call_args_list}
+        self.assertEqual(sides_by_ticker, {"AAA": "buy", "CCC": "sell"})
+
+    def test_trading_status_endpoint_reports_disabled_by_default(self):
+        from app.api import router
+
+        client = _InProcessClient(router)
+        r = client.get("/api/trading/status")
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertFalse(data["enabled"])
+        self.assertIn("recent_trades", data)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

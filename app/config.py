@@ -86,3 +86,41 @@ HOST = os.environ.get("STOCKGRAPH_HOST", "0.0.0.0")
 # STOCKGRAPH_PORT still wins if it's explicitly set (e.g. running locally),
 # but PORT is used as the fallback so this runs unmodified on those hosts.
 PORT = int(os.environ.get("STOCKGRAPH_PORT") or os.environ.get("PORT") or "8000")
+
+# Optional: paper-trading integration with Alpaca (alpaca.markets), a real
+# brokerage whose API has a first-class paper-trading mode -- identical
+# request/response shape to live trading, but every order fills against a
+# simulated account funded with fake money. Get free paper keys at
+# alpaca.markets -> sign up -> Paper Trading tab -> "Generate New Keys";
+# no funding or approval needed since nothing here is real money. This is
+# a real account signup, so it's something only Danny can do -- exactly
+# like ANTHROPIC_API_KEY/STOCKGRAPH_FINNHUB_API_KEY above, this is unset
+# (and the feature entirely off) until he pastes his own keys in.
+#
+# Two independent switches have to both be true before app.trading ever
+# calls the broker: a key pair configured (app.broker.is_configured()) AND
+# TRADING_ENABLED explicitly set -- so this can sit configured-but-off, or
+# never run at all just by never setting STOCKGRAPH_TRADING_ENABLED, with
+# zero risk of turning itself on. ALPACA_BASE_URL defaults to the paper
+# host; pointing it at api.alpaca.markets (live trading, real money) is a
+# deliberate override this project has never been run against and doesn't
+# guard against.
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+TRADING_ENABLED = os.environ.get("STOCKGRAPH_TRADING_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
+# Which trained horizon to trade (shortest by default -- fewer days for the
+# forecast to be wrong before the position is closed out again).
+TRADING_HORIZON_DAYS = int(os.environ.get("STOCKGRAPH_TRADING_HORIZON_DAYS", "1"))
+# Only act on forecasts at or above this model confidence.
+TRADING_MIN_CONFIDENCE = float(os.environ.get("STOCKGRAPH_TRADING_MIN_CONFIDENCE", "0.6"))
+# At most this many open positions at once.
+TRADING_MAX_POSITIONS = int(os.environ.get("STOCKGRAPH_TRADING_MAX_POSITIONS", "5"))
+# Fixed dollar size per position (not a % of equity, so sizing can't spiral
+# with account balance).
+TRADING_POSITION_USD = float(os.environ.get("STOCKGRAPH_TRADING_POSITION_USD", "500"))
+# Kill switch: if the paper account's own reported day-over-day P&L is
+# already worse than -this fraction, skip opening any new positions for
+# the rest of that pass.
+TRADING_MAX_DAILY_LOSS_PCT = float(os.environ.get("STOCKGRAPH_TRADING_MAX_DAILY_LOSS_PCT", "0.03"))

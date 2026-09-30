@@ -175,6 +175,26 @@ CREATE TABLE IF NOT EXISTS fundamentals (
     num_analyst_opinions INTEGER,
     updated_at TEXT NOT NULL
 );
+
+-- Every decision app.trading's paper-trading pass makes, whether it acted
+-- or not (a skipped pass -- kill switch tripped, nothing met the
+-- confidence floor -- is logged too, not just executed trades), so the
+-- site can show a plain-English "what did the bot do and why" history
+-- instead of that only being visible in server logs.
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of TEXT NOT NULL,            -- ISO timestamp this pass ran
+    ticker TEXT,                    -- NULL for a whole-pass note (e.g. kill switch)
+    action TEXT NOT NULL,           -- opened | closed | skipped
+    side TEXT,                      -- buy | sell, when applicable
+    notional_usd REAL,
+    forecast_confidence REAL,
+    forecast_direction TEXT,
+    reason TEXT NOT NULL,
+    alpaca_order_id TEXT,
+    status TEXT NOT NULL            -- ok | error
+);
+CREATE INDEX IF NOT EXISTS idx_paper_trades_as_of ON paper_trades(as_of);
 """
 
 
@@ -756,6 +776,32 @@ def finish_ingestion_run(run_id: int, live_ok: int, live_fail: int, skipped_fres
             "skipped_fresh=?, elapsed_sec=?, error=? WHERE id=?",
             (now_iso(), live_ok, live_fail, skipped_fresh, elapsed_sec, error, run_id),
         )
+
+
+# ---------- paper trading log (app.trading) ----------
+
+
+def insert_paper_trades_batch(rows: list[dict]) -> None:
+    """One pass logs several rows at once (a close per prior position, a
+    skip/open per candidate) -- batched into a single transaction for the
+    same reason insert_forecasts_batch/insert_outcomes_batch are (see
+    those for the full story on why per-row commits were a real cost)."""
+    if not rows:
+        return
+    with tx() as conn:
+        conn.executemany(
+            "INSERT INTO paper_trades(as_of, ticker, action, side, notional_usd, "
+            "forecast_confidence, forecast_direction, reason, alpaca_order_id, status) "
+            "VALUES (:as_of, :ticker, :action, :side, :notional_usd, :forecast_confidence, "
+            ":forecast_direction, :reason, :alpaca_order_id, :status)",
+            rows,
+        )
+
+
+def recent_paper_trades(limit: int = 50) -> list[sqlite3.Row]:
+    return get_conn().execute(
+        "SELECT * FROM paper_trades ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
 
 
 def recent_ingestion_runs(limit: int = 20) -> list[sqlite3.Row]:
