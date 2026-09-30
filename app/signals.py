@@ -453,8 +453,8 @@ class FeaturePanel:
             close_t = self.close[t]
             for h in horizons:
                 fwd = close_t.shift(-h) / close_t - 1.0
-                df[f"fwd_ret_{h}"] = fwd.values
-                df[f"fwd_dir_{h}"] = (fwd.values > 0).astype(float)
+                df[f"fwd_ret_{h}"] = fwd.values.astype(np.float32)
+                df[f"fwd_dir_{h}"] = (fwd.values > 0).astype(np.float32)
             pieces.append(df)
         long_df = pd.concat(pieces, ignore_index=True)
         return long_df
@@ -605,9 +605,18 @@ def build_feature_panel() -> FeaturePanel:
     features["graph_sent_spillover"] = sent_filled @ _NORM_W
 
     for name, df in features.items():
-        features[name] = df.reindex(columns=TICKERS).fillna(0.0)
+        # float32 throughout: this panel (~35 dates x tickers matrices) is
+        # held for the engine's entire lifetime, and every training matrix
+        # downstream (forecast.train_models, scoring.run_backtest,
+        # scoring.run_walk_forward_backtest) is a numeric copy derived from
+        # it -- halving its footprint here roughly halves all of theirs too.
+        # Stock-move features don't need float64's extra ~9 decimal digits
+        # of precision; this became worth doing once the pooled, multi-
+        # horizon training data grew large enough to matter on a memory-
+        # capped host (Render's free tier is 512MB).
+        features[name] = df.reindex(columns=TICKERS).fillna(0.0).astype(np.float32)
 
     global FEATURE_COLUMNS
     FEATURE_COLUMNS = list(features.keys())
 
-    return FeaturePanel(close=close, features=features, dates=dates)
+    return FeaturePanel(close=close.astype(np.float32), features=features, dates=dates)

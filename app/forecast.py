@@ -21,6 +21,7 @@ forecast still stands on its own.
 """
 from __future__ import annotations
 
+import gc
 import json
 import logging
 from dataclasses import dataclass, field
@@ -128,14 +129,29 @@ def train_models(panel: FeaturePanel, horizons: list[int] = HORIZONS) -> Forecas
     models = ForecastModels(feature_names=feature_cols)
 
     for h in horizons:
-        df = long_df.dropna(subset=[f"fwd_ret_{h}"]).copy()
+        # Select only this horizon's columns *before* dropping/copying --
+        # long_df carries all `horizons` worth of fwd_ret_*/fwd_dir_* label
+        # columns at once (needed so as_long_frame only walks the panel
+        # once), but each iteration here only needs one horizon's pair.
+        # Copying the full row width 3x over (once per horizon) was pure
+        # waste on a memory-capped host (see this function's dtype/gc.collect
+        # comments below for the rest of this pass's memory work).
+        cols = feature_cols + ["date", f"fwd_ret_{h}", f"fwd_dir_{h}"]
+        df = long_df.loc[long_df[f"fwd_ret_{h}"].notna(), cols].copy()
         if len(df) < MIN_TRAIN_ROWS:
             log.warning("not enough rows to train horizon=%sd (%d rows)", h, len(df))
             continue
 
-        X = df[feature_cols].to_numpy(dtype=float)
-        y_dir = df[f"fwd_dir_{h}"].to_numpy(dtype=float)
-        y_ret = df[f"fwd_ret_{h}"].to_numpy(dtype=float)
+        # float32, not float64: this pools ~150K+ rows x ~35 features across
+        # the whole universe, 3 times over (once per horizon) -- the single
+        # largest recurring allocation in the whole bootstrap. See the
+        # matching comment on FeaturePanel's construction in signals.py.
+        # ml.py's RidgeRegression/LogisticRegression both preserve X's dtype
+        # through fit() rather than silently upcasting, so this actually
+        # halves peak memory here rather than just looking like it does.
+        X = df[feature_cols].to_numpy(dtype=np.float32)
+        y_dir = df[f"fwd_dir_{h}"].to_numpy(dtype=np.float32)
+        y_ret = df[f"fwd_ret_{h}"].to_numpy(dtype=np.float32)
 
         # Chronological split with a purge gap of `h` trading days between
         # train and test: a training row's label already looks `h` days
@@ -183,6 +199,21 @@ def train_models(panel: FeaturePanel, horizons: list[int] = HORIZONS) -> Forecas
             h, len(X_train), acc, mae,
         )
 
+        # pandas DataFrames hold their data in a BlockManager that commonly
+        # creates internal reference cycles -- plain refcounting won't free
+        # `df` (and the X/y arrays views derived from it) promptly, only
+        # Python's periodic cyclic GC will, and that runs on an allocation
+        # heuristic, not on memory pressure. On a host with real headroom
+        # that lag is invisible; on Render's 512MB free tier it was
+        # compounding across horizons and tipping bootstrap into an OOM
+        # kill (see the walk-forward validation README section / git log
+        # for the incident). Forcing a collection here keeps peak RSS to
+        # roughly one horizon's working set instead of all three at once.
+        del df, X, y_dir, y_ret, X_train, X_test, ydir_train, ydir_test, yret_train, yret_test
+        gc.collect()
+
+    del long_df
+    gc.collect()
     return models
 
 

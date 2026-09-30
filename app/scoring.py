@@ -25,18 +25,27 @@ comes from:
 """
 from __future__ import annotations
 
+import gc
 import logging
 
 import numpy as np
 
 from app import db
+from app.config import DATA_MODE
 from app.forecast import ForecastModels, fit_direction_and_magnitude, MIN_TRAIN_ROWS
 from app.signals import FeaturePanel, split_boundary_dates, walk_forward_splits
 
 log = logging.getLogger("stockgraph.scoring")
 
 MIN_FOLD_TEST_ROWS = 20
-DEFAULT_WALK_FORWARD_FOLDS = 5
+# Fewer folds in demo mode -- same reasoning as forecast.LOGISTIC_ITERATIONS:
+# demo data is synthetic and rebuilt from scratch every cold boot, and this
+# background pass fits n_folds extra disposable models *per horizon* on top
+# of everything else a bootstrap already does. Render's free-tier deploy
+# (always demo mode -- see render.yaml) runs on a 512MB cap; trimming this
+# is a real, deliberate safety margin, not just a speed tweak. auto/live
+# mode (Danny's own laptop) keeps the full 5 folds.
+DEFAULT_WALK_FORWARD_FOLDS = 3 if DATA_MODE == "demo" else 5
 DEFAULT_WALK_FORWARD_MIN_TRAIN_FRAC = 0.5
 
 
@@ -47,17 +56,21 @@ def run_backtest(panel: FeaturePanel, models: ForecastModels) -> dict:
     evaluated_at = db.now_iso()
 
     for h, hm in models.by_horizon.items():
-        df = long_df.dropna(subset=[f"fwd_ret_{h}"]).copy()
+        cols = feature_cols + ["ticker", "date", f"fwd_ret_{h}", f"fwd_dir_{h}"]
+        df = long_df.loc[long_df[f"fwd_ret_{h}"].notna(), cols].copy()
         _, test_start_date = split_boundary_dates(df["date"], h)
         test_df = df[df["date"] >= test_start_date]
         if test_df.empty:
+            del df, test_df
             continue
 
-        X_test = test_df[feature_cols].to_numpy(dtype=float)
+        # float32: same reasoning as forecast.train_models -- this is the
+        # single largest recurring allocation in this loop, x3 horizons.
+        X_test = test_df[feature_cols].to_numpy(dtype=np.float32)
         pred_prob = hm.direction.predict_proba(X_test)[:, 1]
         pred_move = hm.magnitude.predict(X_test)
-        actual_move = test_df[f"fwd_ret_{h}"].to_numpy(dtype=float)
-        actual_dir = test_df[f"fwd_dir_{h}"].to_numpy(dtype=float)
+        actual_move = test_df[f"fwd_ret_{h}"].to_numpy(dtype=np.float32)
+        actual_dir = test_df[f"fwd_dir_{h}"].to_numpy(dtype=np.float32)
 
         # Vectorized rather than a per-row iterrows() loop: with tens of
         # thousands of held-out rows per horizon, building each row's dict
@@ -92,6 +105,16 @@ def run_backtest(panel: FeaturePanel, models: ForecastModels) -> dict:
         summary[h] = {"n": len(rows), "hit_rate": hit_rate, "mae": mae}
         log.info("backtest horizon=%sd n=%d hit_rate=%.3f mae=%.4f", h, len(rows), hit_rate, mae)
 
+        # See forecast.train_models's matching comment: pandas DataFrames'
+        # internal BlockManager commonly creates reference cycles that
+        # outlive simple refcounting, and on a memory-capped host (Render's
+        # free tier) that lag across horizons was enough to tip a bootstrap
+        # into an OOM kill.
+        del df, test_df, X_test, pred_prob, pred_move, actual_move, actual_dir, rows
+        gc.collect()
+
+    del long_df
+    gc.collect()
     return summary
 
 
@@ -122,14 +145,23 @@ def run_walk_forward_backtest(
     fold_rows = []
 
     for h in horizons:
-        df = long_df.dropna(subset=[f"fwd_ret_{h}"]).copy()
+        cols = feature_cols + ["date", f"fwd_ret_{h}", f"fwd_dir_{h}"]
+        df = long_df.loc[long_df[f"fwd_ret_{h}"].notna(), cols].copy()
         if len(df) < MIN_TRAIN_ROWS:
+            del df
             continue
 
         dates = df["date"]
-        X = df[feature_cols].to_numpy(dtype=float)
-        y_dir = df[f"fwd_dir_{h}"].to_numpy(dtype=float)
-        y_ret = df[f"fwd_ret_{h}"].to_numpy(dtype=float)
+        # float32: this is the most memory-hungry loop in the whole
+        # bootstrap -- up to n_folds extra full-size copies of X per
+        # horizon (each fold's expanding train_mask/test_mask slice is a
+        # fresh numpy copy, not a view), on top of everything
+        # forecast.train_models/run_backtest above already allocate in the
+        # same process. See their matching comments for why this matters
+        # on Render's 512MB free tier.
+        X = df[feature_cols].to_numpy(dtype=np.float32)
+        y_dir = df[f"fwd_dir_{h}"].to_numpy(dtype=np.float32)
+        y_ret = df[f"fwd_ret_{h}"].to_numpy(dtype=np.float32)
 
         for fold_idx, train_end_date, test_start_date, test_end_date in walk_forward_splits(
             dates, h, n_folds=n_folds, min_train_frac=min_train_frac
@@ -169,7 +201,21 @@ def run_walk_forward_backtest(
                 train_end_date.date(), test_start_date.date(), test_end_date.date(),
             )
 
+            # Each fold fits and discards a full model pair on its own
+            # expanding-window slice -- by far the most memory this
+            # function touches, repeated up to n_folds times per horizon.
+            # See forecast.train_models's matching comment on why an
+            # explicit collection (not just the del) matters on a
+            # memory-capped host.
+            del dir_pipe, mag_pipe, X_test, direction_correct, train_mask, test_mask
+            gc.collect()
+
+        del df, dates, X, y_dir, y_ret
+        gc.collect()
+
     db.replace_walk_forward_folds(fold_rows)
+    del long_df
+    gc.collect()
     return {"n_folds_scored": len(fold_rows)}
 
 

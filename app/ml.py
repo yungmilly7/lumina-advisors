@@ -44,8 +44,17 @@ class RidgeRegression:
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "RidgeRegression":
         n, d = X.shape
-        Xb = np.hstack([np.ones((n, 1)), X])
-        A = Xb.T @ Xb + self.alpha * np.eye(d + 1)
+        # dtype=X.dtype matters more than it looks: np.ones() defaults to
+        # float64, and hstack-ing that onto a float32 X silently upcasts the
+        # WHOLE concatenated (n, d+1) matrix back to float64 -- quietly
+        # doubling memory for exactly the largest array in this function,
+        # and defeating any float32 the caller passed in specifically to
+        # avoid that (see forecast.py/scoring.py, where every training
+        # matrix is float32 for this reason -- this project's pooled,
+        # multi-horizon training data is large enough that peak RSS on a
+        # memory-capped host, like Render's free tier, is a real constraint).
+        Xb = np.hstack([np.ones((n, 1), dtype=X.dtype), X])
+        A = Xb.T @ Xb + self.alpha * np.eye(d + 1, dtype=X.dtype)
         A[0, 0] -= self.alpha  # don't regularize the intercept
         b = Xb.T @ y
         coef = np.linalg.solve(A, b)
@@ -69,9 +78,9 @@ class LogisticRegression:
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "LogisticRegression":
         n, d = X.shape
-        w = np.zeros(d)
+        w = np.zeros(d, dtype=X.dtype)  # matches X's dtype so X @ w doesn't upcast every iteration
         b = 0.0
-        y = y.astype(float)
+        y = y.astype(X.dtype)
         for _ in range(self.iterations):
             z = X @ w + b
             p = 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
